@@ -306,8 +306,7 @@ public class BatchPQS : MonoBehaviour
         }
     }
 
-    Transform QuadParent =>
-        useLocalStorage ? pqs.LocalSpacePQStorage.transform : pqs.transform;
+    Transform QuadParent => useLocalStorage ? pqs.LocalSpacePQStorage.transform : pqs.transform;
 
     static void SetParentIfChanged(Transform transform, Transform parent)
     {
@@ -318,7 +317,12 @@ public class BatchPQS : MonoBehaviour
     // Replaces the parent assignment in PQS.AssignQuad. Child quads go
     // straight to the parent PlaceQuad will use, so they only change
     // hierarchy once.
-    internal static void AssignQuadParent(Transform transform, Transform parent, PQS pqs, int subdiv)
+    internal static void AssignQuadParent(
+        Transform transform,
+        Transform parent,
+        PQS pqs,
+        int subdiv
+    )
     {
         var batchPQS = subdiv > 0 ? Get(pqs) : null;
         if (batchPQS is not null && batchPQS.ManagesQuadPlacement)
@@ -598,8 +602,9 @@ public class BatchPQS : MonoBehaviour
         | MeshUpdateFlags.DontNotifyMeshUsers
         | MeshUpdateFlags.DontRecalculateBounds;
 
-    static readonly VertexAttributeDescriptor[] AttributeScratch =
-        new VertexAttributeDescriptor[VertexAttributeCount];
+    static readonly VertexAttributeDescriptor[] AttributeScratch = new VertexAttributeDescriptor[
+        VertexAttributeCount
+    ];
     static readonly int[] StreamAttributeCounts = new int[MaxVertexStreams];
 
     // Stream holding only that attribute as Float32, or -1.
@@ -824,9 +829,7 @@ public class BatchPQS : MonoBehaviour
         {
             primary = new SubdivisionTarget
             {
-                directionNormalized = BurstUtil.ConvertVector(
-                    pqs.relativeTargetPositionNormalized
-                ),
+                directionNormalized = BurstUtil.ConvertVector(pqs.relativeTargetPositionNormalized),
                 absHeight = Math.Abs(pqs.targetHeight),
                 collapseFactor = pqs.collapseThreshold,
                 maxLevelAtSpeed = Math.Max(pqs.maxLevelAtCurrentTgtSpeed, primaryColliderLevel),
@@ -865,7 +868,8 @@ public class BatchPQS : MonoBehaviour
     // Cache PQ fields in native memory to avoid reading every managed quad each frame.
     // Rebuild the cache when the tree resets; otherwise refresh affected quads.
     private readonly List<PQ> activeQuads = new(2048);
-    private readonly Dictionary<PQ, int> activeQuadIndices = new(2048);
+    // We use PQWrap here so the we can inline a ReferenceEquals comparison
+    private readonly Dictionary<PQWrap, int> activeQuadIndices = new(2048);
     private readonly List<PQ> quadsToRefresh = [];
     private NativeList<QuadSnapshot> snapshots;
     private bool needsQuadRescan = true;
@@ -1588,5 +1592,16 @@ public class BatchPQS : MonoBehaviour
                 jobSet?.Dispose();
             }
         }
+    }
+
+    struct PQWrap(PQ quad) : IEquatable<PQWrap>
+    {
+        public PQ quad = quad;
+
+        public static implicit operator PQ(PQWrap wrap) => wrap.quad;
+
+        public static implicit operator PQWrap(PQ quad) => new(quad);
+
+        public readonly bool Equals(PQWrap other) => ReferenceEquals(quad, other.quad);
     }
 }
