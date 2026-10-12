@@ -10,6 +10,7 @@ namespace BurstPQS.Util.Textures;
 /// <remarks>
 /// Like texconv, the two-subset modes only get a full fit for the partitions that rank best on
 /// a rough estimate, and mode 7 is skipped for opaque blocks since 1 and 3 cover those.
+/// The fast setting follows bc7e's fastest preset, which only tries mode 6.
 /// </remarks>
 internal static unsafe class BC7
 {
@@ -99,13 +100,16 @@ internal static unsafe class BC7
     }
 
     /// <summary>Encodes 16 RGBA pixels in [0, 255] as one BC7 block.</summary>
-    public static Block128 Encode(float4* px)
+    public static Block128 Encode(float4* px, bool fast)
     {
+        if (fast)
+            return EncodeFast(px);
+
         bool opaque = true;
         for (int i = 0; i < 16; i++)
             opaque &= px[i].w >= 255f;
 
-        var best = EncodeShape(px, Mode6, 0);
+        var best = EncodeShape(px, Mode6, 0, false);
         if (best.error <= 0f)
             return Pack(best);
 
@@ -114,23 +118,50 @@ internal static unsafe class BC7
 
         for (int i = 0; i < ShapeCandidates; i++)
         {
-            var candidate = EncodeShape(px, Mode1, shapes[i]);
+            var candidate = EncodeShape(px, Mode1, shapes[i], false);
             if (candidate.error < best.error)
                 best = candidate;
 
-            candidate = EncodeShape(px, Mode3, shapes[i]);
+            candidate = EncodeShape(px, Mode3, shapes[i], false);
             if (candidate.error < best.error)
                 best = candidate;
 
             if (opaque)
                 continue;
 
-            candidate = EncodeShape(px, Mode7, shapes[i]);
+            candidate = EncodeShape(px, Mode7, shapes[i], false);
             if (candidate.error < best.error)
                 best = candidate;
         }
 
         return Pack(best);
+    }
+
+    // bc7e's fastest approach: mode 6 alone, with solid blocks going straight to the fit that
+    // puts a palette entry on their colour.
+    static Block128 EncodeFast(float4* px)
+    {
+        bool solid = true;
+        for (int i = 1; i < 16; i++)
+            solid &= math.all(px[i] == px[0]);
+
+        if (!solid)
+            return Pack(EncodeShape(px, Mode6, 0, true));
+
+        var s = new Subset(px, 0xFFFF);
+        var fit = new SubsetFit { error = float.PositiveInfinity };
+        TrySolid(ref s, Mode6, px[0], ref fit);
+
+        return Pack(
+            new Candidate
+            {
+                mode = Mode6,
+                error = fit.error,
+                start0 = fit.start,
+                end0 = fit.end,
+                indices = fit.indices,
+            }
+        );
     }
 
     // Picks the partitions whose subsets lie closest to a line each, measured as the variance
@@ -203,7 +234,7 @@ internal static unsafe class BC7
         }
     }
 
-    static Candidate EncodeShape(float4* px, Mode mode, int shape)
+    static Candidate EncodeShape(float4* px, Mode mode, int shape, bool fast)
     {
         var candidate = new Candidate { mode = mode, shape = shape };
 
@@ -215,7 +246,8 @@ internal static unsafe class BC7
                 mode,
                 out candidate.start0,
                 out candidate.end0,
-                ref candidate.indices
+                ref candidate.indices,
+                fast
             );
             return candidate;
         }
@@ -228,7 +260,8 @@ internal static unsafe class BC7
                 mode,
                 out candidate.start0,
                 out candidate.end0,
-                ref candidate.indices
+                ref candidate.indices,
+                fast
             )
             + FitSubset(
                 px,
@@ -236,7 +269,8 @@ internal static unsafe class BC7
                 mode,
                 out candidate.start1,
                 out candidate.end1,
-                ref candidate.indices
+                ref candidate.indices,
+                fast
             );
 
         return candidate;
@@ -245,14 +279,12 @@ internal static unsafe class BC7
     // A subset's pixels packed into consecutive lanes, so Assign can test 8 at a time.
     struct Subset
     {
-        public fixed float r[16];
-        public fixed float g[16];
-        public fixed float b[16];
-        public fixed float a[16];
-        public fixed byte position[16];
+        public const int Used = 4;
 
-        // 1 for the lanes holding a pixel, 0 past the end.
-        public fixed float used[16];
+        // 16 lanes for each of R, G, B, A, then Used: 1 for the lanes holding a pixel, 0 past
+        // the end.
+        fixed float lanes[5 * 16];
+        public fixed byte position[16];
         public int count;
         public float4 sum;
 
@@ -270,15 +302,19 @@ internal static unsafe class BC7
                 if ((pixels & (1 << i)) == 0)
                     continue;
 
-                r[count] = px[i].x;
-                g[count] = px[i].y;
-                b[count] = px[i].z;
-                a[count] = px[i].w;
+                for (int ch = 0; ch < 4; ch++)
+                    lanes[ch * 16 + count] = px[i][ch];
+                lanes[Used * 16 + count] = 1f;
                 position[count] = (byte)i;
-                used[count] = 1f;
                 sum += px[i];
                 count++;
             }
+        }
+
+        public float8 Lanes(int channel, int half)
+        {
+            fixed (float* p = lanes)
+                return Load(p + channel * 16 + half * 8);
         }
 
         public bool FirstTry(Endpoint start, Endpoint end)
@@ -324,7 +360,8 @@ internal static unsafe class BC7
         Mode mode,
         out Endpoint start,
         out Endpoint end,
-        ref ulong indices
+        ref ulong indices,
+        bool fast
     )
     {
         // Modes without alpha always decode it as 255, so the fit only aims for that.
@@ -350,22 +387,22 @@ internal static unsafe class BC7
             maxT = math.max(maxT, t);
         }
 
-        Try(&s, mode, mean + axis * minT, mean + axis * maxT, ref fit);
+        Try(ref s, mode, mean + axis * minT, mean + axis * maxT, ref fit);
 
         if (maxT > minT)
         {
             for (int iter = 0; iter < BlockMath.RefineIterations && fit.error > 0f; iter++)
             {
-                if (!TryLeastSquares(&s, mode, fit.indices, ref fit))
+                if (!TryLeastSquares(ref s, mode, fit.indices, ref fit))
                     break;
             }
 
-            if (fit.error > 0f)
-                TryPerturbedIndices(&s, pixels, mode, ref fit);
+            if (!fast && fit.error > 0f)
+                TryPerturbedIndices(ref s, pixels, mode, ref fit);
         }
 
         if (fit.error > 0f)
-            TrySolid(&s, mode, mean, ref fit);
+            TrySolid(ref s, mode, mean, ref fit);
 
         start = fit.start;
         end = fit.end;
@@ -375,7 +412,7 @@ internal static unsafe class BC7
 
     const int SpreadSteps = 1;
 
-    static void TryPerturbedIndices(Subset* s, int pixels, Mode mode, ref SubsetFit fit)
+    static void TryPerturbedIndices(ref Subset s, int pixels, Mode mode, ref SubsetFit fit)
     {
         int max = (1 << mode.indexBits) - 1;
         ulong selected = fit.indices;
@@ -410,7 +447,7 @@ internal static unsafe class BC7
                 shifted |= (ulong)index << (i * 4);
             }
 
-            TryLeastSquares(s, mode, shifted, ref fit);
+            TryLeastSquares(ref s, mode, shifted, ref fit);
         }
 
         // Remap the indices as though the endpoints sat a step or so outside or inside where
@@ -434,45 +471,41 @@ internal static unsafe class BC7
                     spread |= (ulong)math.clamp((int)remapped, 0, max) << (i * 4);
                 }
 
-                TryLeastSquares(s, mode, spread, ref fit);
+                TryLeastSquares(ref s, mode, spread, ref fit);
             }
         }
     }
 
     // Solves for the endpoints that best reproduce the targets given these indices.
-    //
-    // The pixels are whole numbers and the weights multiples of 1/64, so every sum here is exact
-    // in any order. That lets the sums run 8 pixels at a time, and lets the ones over u = 1 - w
-    // come from the ones over w.
-    static bool TryLeastSquares(Subset* s, Mode mode, ulong selected, ref SubsetFit fit)
+    static bool TryLeastSquares(ref Subset s, Mode mode, ulong selected, ref SubsetFit fit)
     {
         int count = 1 << mode.indexBits;
 
         var weights = stackalloc float[16];
         for (int k = 0; k < 16; k++)
-            weights[k] = Weight(Index(selected, s->position[k]), count) / 64f;
+            weights[k] = Weight(Index(selected, s.position[k]), count) / 64f;
 
-        float8 w0 = Load(weights) * Load(s->used),
-            w1 = Load(weights + 8) * Load(s->used + 8);
+        float8 w0 = Load(weights) * s.Lanes(Subset.Used, 0),
+            w1 = Load(weights + 8) * s.Lanes(Subset.Used, 1);
 
         float sumW = Sum(w0 + w1);
         float c = Sum(w0 * w0 + w1 * w1);
         float b = sumW - c;
-        float a = s->count - sumW - b;
+        float a = s.count - sumW - b;
 
         var d1 = new float4(
-            Sum(w0 * Load(s->r) + w1 * Load(s->r + 8)),
-            Sum(w0 * Load(s->g) + w1 * Load(s->g + 8)),
-            Sum(w0 * Load(s->b) + w1 * Load(s->b + 8)),
-            Sum(w0 * Load(s->a) + w1 * Load(s->a + 8))
+            Sum(w0 * s.Lanes(0, 0) + w1 * s.Lanes(0, 1)),
+            Sum(w0 * s.Lanes(1, 0) + w1 * s.Lanes(1, 1)),
+            Sum(w0 * s.Lanes(2, 0) + w1 * s.Lanes(2, 1)),
+            Sum(w0 * s.Lanes(3, 0) + w1 * s.Lanes(3, 1))
         );
-        float4 total = s->sum;
+        float4 total = s.sum;
 
         // Modes without alpha always decode it as 255, so the fit only aims for that.
         if (mode.alphaBits == 0)
         {
             d1.w = 255f * sumW;
-            total.w = 255f * s->count;
+            total.w = 255f * s.count;
         }
 
         float4 d0 = total - d1;
@@ -482,24 +515,24 @@ internal static unsafe class BC7
             return false;
 
         float inv = 1f / det;
-        return Try(s, mode, (c * d0 - b * d1) * inv, (a * d1 - b * d0) * inv, ref fit);
+        return Try(ref s, mode, (c * d0 - b * d1) * inv, (a * d1 - b * d0) * inv, ref fit);
     }
 
     // Quantizes the endpoints under every p-bit combination the mode allows.
-    static bool Try(Subset* s, Mode mode, float4 a, float4 b, ref SubsetFit fit)
+    static bool Try(ref Subset s, Mode mode, float4 a, float4 b, ref SubsetFit fit)
     {
         var start0 = Quantize(a, mode, 0);
         var start1 = Quantize(a, mode, 1);
         var end0 = Quantize(b, mode, 0);
         var end1 = Quantize(b, mode, 1);
 
-        bool improved = Evaluate(s, mode, start0, end0, ref fit);
+        bool improved = Evaluate(ref s, mode, start0, end0, ref fit);
         if (!mode.sharedPBit)
         {
-            improved |= Evaluate(s, mode, start1, end0, ref fit);
-            improved |= Evaluate(s, mode, start0, end1, ref fit);
+            improved |= Evaluate(ref s, mode, start1, end0, ref fit);
+            improved |= Evaluate(ref s, mode, start0, end1, ref fit);
         }
-        improved |= Evaluate(s, mode, start1, end1, ref fit);
+        improved |= Evaluate(ref s, mode, start1, end1, ref fit);
 
         return improved;
     }
@@ -507,7 +540,7 @@ internal static unsafe class BC7
     // Fits endpoints that put the mode's solid palette entry on the colour. Quantizing the
     // endpoints to the colour itself only reaches the values an endpoint can hold, while an
     // interpolated entry can land on nearly every value exactly.
-    static void TrySolid(Subset* s, Mode mode, float4 color, ref SubsetFit fit)
+    static void TrySolid(ref Subset s, Mode mode, float4 color, ref SubsetFit fit)
     {
         if (mode.solidIndex < 0)
             return;
@@ -521,65 +554,71 @@ internal static unsafe class BC7
             var start = new Endpoint { pbit = mode.sharedPBit ? p : p & 1 };
             var end = new Endpoint { pbit = mode.sharedPBit ? p : p >> 1 };
 
-            for (int ch = 0; ch < 4; ch++)
-            {
-                int bits = ch < 3 ? mode.colorBits : mode.alphaBits;
-                if (bits == 0)
-                {
-                    start.value[ch] = 255;
-                    end.value[ch] = 255;
-                    continue;
-                }
+            // Alpha has either the colour's bits or none, so every channel can share them.
+            SolidChannels(target, w, mode.colorBits, ref start, ref end);
 
-                SolidChannel(target[ch], w, bits, ch, ref start, ref end);
+            if (mode.alphaBits == 0)
+            {
+                start.bits.w = 0;
+                start.value.w = 255;
+                end.bits.w = 0;
+                end.value.w = 255;
             }
 
-            Evaluate(s, mode, start, end, ref fit);
+            Evaluate(ref s, mode, start, end, ref fit);
         }
     }
 
     const int SolidSearchSteps = 4;
 
-    static void SolidChannel(int c, int w, int bits, int ch, ref Endpoint start, ref Endpoint end)
+    // Searches start values around the colour, and for each the end values either side of the
+    // one that would put the interpolated entry on it. Each channel keeps the first of its
+    // closest pairs.
+    static void SolidChannels(int4 c, int w, int bits, ref Endpoint pstart, ref Endpoint pend)
     {
+        var start = pstart;
+        var end = pend;
+
         int max = (1 << bits) - 1;
-        int center = QuantizeChannel(c, bits, start.pbit);
-        int bestErr = int.MaxValue;
+        int4 center = QuantizeBits(c, bits, start.pbit);
+        int4 bestErr = int.MaxValue;
 
-        int first = math.max(center - SolidSearchSteps, 0);
-        int last = math.min(center + SolidSearchSteps, max);
-        for (int lo = first; lo <= last; lo++)
+        for (int k = -SolidSearchSteps; k <= SolidSearchSteps; k++)
         {
-            int loValue = Expand(lo << 1 | start.pbit, bits + 1);
+            int4 lo = center + k;
+            bool4 loValid = lo >= 0 & lo <= max;
+            int4 loValue = Expand(lo << 1 | start.pbit, bits + 1);
 
-            // The end value that puts the interpolated entry closest to c.
-            float ideal = (64f * c - (64 - w) * loValue) / w;
-            int guess = QuantizeChannel(ideal, bits, end.pbit);
+            float4 ideal = (64f * (float4)c - (float4)((64 - w) * loValue)) / w;
+            int4 guess = QuantizeBits(ideal, bits, end.pbit);
 
-            for (int hi = math.max(guess - 1, 0); hi <= math.min(guess + 1, max); hi++)
+            for (int j = -1; j <= 1; j++)
             {
-                int hiValue = Expand(hi << 1 | end.pbit, bits + 1);
-                int value = ((64 - w) * loValue + w * hiValue + 32) >> 6;
-                int err = (value - c) * (value - c);
-                if (err >= bestErr)
-                    continue;
+                int4 hi = guess + j;
+                int4 hiValue = Expand(hi << 1 | end.pbit, bits + 1);
+                int4 value = ((64 - w) * loValue + w * hiValue + 32) >> 6;
+                int4 err = (value - c) * (value - c);
+                bool4 better = loValid & hi >= 0 & hi <= max & err < bestErr;
 
-                bestErr = err;
-                start.bits[ch] = lo;
-                start.value[ch] = loValue;
-                end.bits[ch] = hi;
-                end.value[ch] = hiValue;
+                bestErr = math.select(bestErr, err, better);
+                start.bits = math.select(start.bits, lo, better);
+                start.value = math.select(start.value, loValue, better);
+                end.bits = math.select(end.bits, hi, better);
+                end.value = math.select(end.value, hiValue, better);
             }
         }
+
+        pstart = start;
+        pend = end;
     }
 
-    static bool Evaluate(Subset* s, Mode mode, Endpoint start, Endpoint end, ref SubsetFit fit)
+    static bool Evaluate(ref Subset s, Mode mode, Endpoint start, Endpoint end, ref SubsetFit fit)
     {
         // A repeat can't beat the fit, which is already at least as good as its first try.
-        if (!s->FirstTry(start, end))
+        if (!s.FirstTry(start, end))
             return false;
 
-        float error = Assign(s, mode, start, end, out ulong indices);
+        float error = Assign(ref s, mode, start, end, out ulong indices);
         if (error >= fit.error)
             return false;
 
@@ -595,19 +634,19 @@ internal static unsafe class BC7
 
     // Picks the nearest palette entry for each pixel in the subset, 8 pixels per vector. Every
     // distance is a whole number well under 2^24, so the float sums are exact.
-    static float Assign(Subset* s, Mode mode, Endpoint start, Endpoint end, out ulong indices)
+    static float Assign(ref Subset s, Mode mode, Endpoint start, Endpoint end, out ulong indices)
     {
         int count = 1 << mode.indexBits;
-        bool upper = s->count > 8;
+        bool upper = s.count > 8;
 
-        float8 r0 = Load(s->r),
-            g0 = Load(s->g),
-            b0 = Load(s->b),
-            a0 = Load(s->a);
-        float8 r1 = Load(s->r + 8),
-            g1 = Load(s->g + 8),
-            b1 = Load(s->b + 8),
-            a1 = Load(s->a + 8);
+        float8 r0 = s.Lanes(0, 0),
+            g0 = s.Lanes(1, 0),
+            b0 = s.Lanes(2, 0),
+            a0 = s.Lanes(3, 0);
+        float8 r1 = s.Lanes(0, 1),
+            g1 = s.Lanes(1, 1),
+            b1 = s.Lanes(2, 1),
+            a1 = s.Lanes(3, 1);
 
         float8 min0 = float.PositiveInfinity,
             min1 = float.PositiveInfinity;
@@ -648,11 +687,11 @@ internal static unsafe class BC7
 
         float error = 0f;
         ulong packed = 0;
-        int pixels = s->count;
+        int pixels = s.count;
         for (int k = 0; k < pixels; k++)
         {
             error += mins[k];
-            packed |= (ulong)(int)selected[k] << (s->position[k] * 4);
+            packed |= (ulong)(int)selected[k] << (s.position[k] * 4);
         }
 
         indices = packed;
@@ -696,11 +735,7 @@ internal static unsafe class BC7
         // Alpha has either the colour's bits or none, so every channel can share them.
         int bits = mode.colorBits;
         int max = (1 << bits) - 1;
-        int4 guess = math.clamp(
-            (int4)math.round((e * ((2 << bits) - 1) / 255f - pbit) * 0.5f),
-            0,
-            max
-        );
+        int4 guess = QuantizeBits(e, bits, pbit);
 
         var endpoint = new Endpoint { pbit = pbit };
         float4 bestErr = float.PositiveInfinity;
@@ -726,14 +761,13 @@ internal static unsafe class BC7
         return endpoint;
     }
 
-    static int QuantizeChannel(float v, int bits, int pbit) =>
+    // The stored bits whose expanded value lies nearest, give or take rounding.
+    static int4 QuantizeBits(float4 v, int bits, int pbit) =>
         math.clamp(
-            (int)math.round((v * ((2 << bits) - 1) / 255f - pbit) * 0.5f),
+            (int4)math.round((v * ((2 << bits) - 1) / 255f - pbit) * 0.5f),
             0,
             (1 << bits) - 1
         );
-
-    static int Expand(int value, int bits) => value << (8 - bits) | value >> (2 * bits - 8);
 
     static int4 Expand(int4 value, int bits) => value << (8 - bits) | value >> (2 * bits - 8);
 

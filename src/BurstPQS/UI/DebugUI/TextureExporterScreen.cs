@@ -162,9 +162,9 @@ internal class TextureExporterScreen : MonoBehaviour
         _projectionDropdown.value = 0;
         _projectionDropdown.RefreshShownValue();
 
-        SetOptions(_heightFormatDropdown, ["PNG", "R8 DDS", "R16 DDS", "BC4 DDS"]);
-        SetOptions(_colorFormatDropdown, ["PNG", "DXT1 DDS", "DXT5 DDS", "BC7 DDS"]);
-        SetOptions(_normalFormatDropdown, ["PNG", "DXT5nm DDS", "BC5 DDS"]);
+        SetOptions(_heightFormatDropdown, ["PNG", "R8", "R16", "BC4"]);
+        SetOptions(_colorFormatDropdown, ["PNG", "DXT1", "DXT5", "BC7", "BC7 (fast)"]);
+        SetOptions(_normalFormatDropdown, ["PNG", "DXT5nm", "BC5"]);
     }
 
     // Option order matches the declaration order of the corresponding format enum.

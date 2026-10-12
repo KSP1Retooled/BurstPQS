@@ -32,6 +32,7 @@ public enum ColorFormat
     DXT1,
     DXT5,
     BC7,
+    BC7Fast,
 }
 
 public enum NormalFormat
@@ -1078,6 +1079,7 @@ internal static class TextureExporter
                     ColorFormat.DXT1 => BlockEncoding.BC1,
                     ColorFormat.DXT5 => BlockEncoding.BC3,
                     ColorFormat.BC7 => BlockEncoding.BC7,
+                    ColorFormat.BC7Fast => BlockEncoding.BC7Fast,
                     _ => (BlockEncoding?)null,
                 };
 
@@ -1399,7 +1401,7 @@ internal static class TextureExporter
             {
                 BlockEncoding.BC1 => DdsFormat.BC1,
                 BlockEncoding.BC5 => DdsFormat.BC5,
-                BlockEncoding.BC7 => DdsFormat.BC7,
+                BlockEncoding.BC7 or BlockEncoding.BC7Fast => DdsFormat.BC7,
                 _ => DdsFormat.BC3,
             };
 

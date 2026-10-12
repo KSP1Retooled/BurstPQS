@@ -21,6 +21,7 @@ internal enum BlockEncoding
     /// <summary>BC5 with X in red and Y in green.</summary>
     BC5,
     BC7,
+    BC7Fast,
 }
 
 internal static class BlockEncodingExt
@@ -102,7 +103,8 @@ internal unsafe struct TextureExportCompressJob : IJobParallelForBatch
                     break;
 
                 case BlockEncoding.BC7:
-                    ((Block128*)dst)[block] = BC7.Encode(px);
+                case BlockEncoding.BC7Fast:
+                    ((Block128*)dst)[block] = BC7.Encode(px, encoding == BlockEncoding.BC7Fast);
                     break;
             }
         }
