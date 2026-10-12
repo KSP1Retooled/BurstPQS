@@ -147,17 +147,20 @@ public static class MathUtil
         return new(math.select(a.lo, b.lo, c.lo != 0), math.select(a.hi, b.hi, c.hi != 0));
     }
 
+    // Same as math.mad: a * b + c.
+    internal static float8 Mad(float8 a, float8 b, float8 c)
+    {
+        if (Fma.IsFmaSupported)
+            return Fma.mm256_fmadd_ps(a, b, c);
+        return new(math.mad(a.lo, b.lo, c.lo), math.mad(a.hi, b.hi, c.hi));
+    }
+
     // Loads 8 float3s and transposes them into one float8 per component.
     //
     // With AVX2 the lanes hold vertices 0 2 4 6 1 3 5 7, which is the order
     // StoreTransposed8 can write back without crossing 128-bit lanes. Only
     // use the result for lane-wise math and pair it with StoreTransposed8.
-    internal static unsafe void LoadTransposed8(
-        float3* p,
-        out float8 x,
-        out float8 y,
-        out float8 z
-    )
+    internal static unsafe void LoadTransposed8(float3* p, out float8 x, out float8 y, out float8 z)
     {
         if (Avx2.IsAvx2Supported)
         {
@@ -193,13 +196,7 @@ public static class MathUtil
     // Transposes one float8 per component back into 8 float4s and stores them.
     // Expects the lane order produced by LoadTransposed8.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static unsafe void StoreTransposed8(
-        float4* p,
-        float8 x,
-        float8 y,
-        float8 z,
-        float8 w
-    )
+    internal static unsafe void StoreTransposed8(float4* p, float8 x, float8 y, float8 z, float8 w)
     {
         if (Avx2.IsAvx2Supported)
         {
