@@ -76,6 +76,41 @@ internal struct TextureExportEncodeHeightsRGB24Job : IJobParallelForBatch
 }
 
 /// <summary>
+/// Encodes heights to single-channel 8-bit (R8), normalized to [0, 1]
+/// between <see cref="minH"/> and <see cref="maxH"/>.
+/// </summary>
+[BurstCompile]
+internal struct TextureExportEncodeHeightsR8Job : IJobParallelForBatch
+{
+    [ReadOnly]
+    public NativeArray<float> heights;
+
+    [WriteOnly]
+    public NativeArray<byte> output;
+
+    public float minH;
+    public float maxH;
+
+    public void Execute(int start, int count)
+    {
+        float range = maxH - minH;
+        int end = start + count;
+
+        if (range <= 0.0 || math.isnan(range) || math.isinf(range))
+        {
+            for (int i = start; i < end; ++i)
+                output[i] = 0;
+            return;
+        }
+
+        var invrange = math.rcp(range);
+
+        for (int i = start; i < end; ++i)
+            output[i] = (byte)(math.saturate((heights[i] - minH) * invrange) * 255f);
+    }
+}
+
+/// <summary>
 /// Encodes heights to single-channel 16-bit (R16), normalized to [0, 1]
 /// between <see cref="minH"/> and <see cref="maxH"/>.
 /// </summary>

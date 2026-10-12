@@ -20,8 +20,25 @@ namespace BurstPQS.Tools;
 
 public enum HeightFormat
 {
-    RGB24,
+    Png,
+    R8,
     R16,
+    BC4,
+}
+
+public enum ColorFormat
+{
+    Png,
+    DXT1,
+    DXT5,
+    BC7,
+}
+
+public enum NormalFormat
+{
+    Png,
+    DXT5nm,
+    BC5,
 }
 
 /// <summary>
@@ -83,6 +100,8 @@ internal struct TextureExportOptions
     public bool exportColor;
     public bool exportNormal;
     public HeightFormat heightFormat;
+    public ColorFormat colorFormat;
+    public NormalFormat normalFormat;
     public bool orientNorthUp;
 
     public readonly int Width => resolution;
@@ -476,62 +495,97 @@ internal static class TextureExporter
             /// </summary>
             public JobHandle ScheduleSave(HeightFormat format, float minH, float maxH)
             {
-                string path;
-                JobHandle handle;
-
-                if (format == HeightFormat.R16)
-                {
-                    var pixels = new NativeArray<ushort>(
-                        Heights.Length,
-                        Allocator.Persistent,
-                        NativeArrayOptions.UninitializedMemory
-                    );
-                    var encodeHandle = new TextureExportEncodeHeightsR16Job
-                    {
-                        heights = Heights,
-                        output = pixels,
-                        minH = minH,
-                        maxH = maxH,
-                    }.ScheduleBatch(Heights.Length, 8192);
-
-                    path = outputPath + ".dds";
-                    handle = ScheduleSaveDdsR16Job(
-                        pixels,
-                        resX,
-                        resY,
-                        path,
-                        ScheduleRelease(encodeHandle)
-                    );
-                    handle = pixels.Dispose(handle);
-                }
-                else
-                {
-                    var pixels = new NativeArray<Color32>(
-                        Heights.Length,
-                        Allocator.Persistent,
-                        NativeArrayOptions.UninitializedMemory
-                    );
-                    var encodeHandle = new TextureExportEncodeHeightsRGB24Job
-                    {
-                        heights = Heights,
-                        output = pixels,
-                        minH = minH,
-                        maxH = maxH,
-                    }.ScheduleBatch(Heights.Length, 8192);
-
-                    path = outputPath + ".png";
-                    handle = ScheduleSaveJob(
-                        pixels,
-                        resX,
-                        resY,
-                        path,
-                        ScheduleRelease(encodeHandle)
-                    );
-                    handle = pixels.Dispose(handle);
-                }
-
+                int count = Heights.Length;
+                string path = outputPath + (format == HeightFormat.Png ? ".png" : ".dds");
                 Debug.Log($"[BurstPQS] Writing {path}");
-                return handle;
+
+                switch (format)
+                {
+                    case HeightFormat.R8:
+                    {
+                        var pixels = AllocatePixels<byte>(count);
+                        var encodeHandle = new TextureExportEncodeHeightsR8Job
+                        {
+                            heights = Heights,
+                            output = pixels,
+                            minH = minH,
+                            maxH = maxH,
+                        }.ScheduleBatch(count, 8192);
+
+                        return ScheduleSaveDdsJob(
+                            ref pixels,
+                            DdsFormat.R8,
+                            resX,
+                            resY,
+                            path,
+                            ScheduleRelease(encodeHandle)
+                        );
+                    }
+
+                    case HeightFormat.R16:
+                    {
+                        var pixels = AllocatePixels<ushort>(count);
+                        var encodeHandle = new TextureExportEncodeHeightsR16Job
+                        {
+                            heights = Heights,
+                            output = pixels,
+                            minH = minH,
+                            maxH = maxH,
+                        }.ScheduleBatch(count, 8192);
+
+                        return ScheduleSaveDdsJob(
+                            ref pixels,
+                            DdsFormat.R16,
+                            resX,
+                            resY,
+                            path,
+                            ScheduleRelease(encodeHandle)
+                        );
+                    }
+
+                    case HeightFormat.BC4:
+                    {
+                        int blocks = count / 16;
+                        var pixels = AllocatePixels<ulong>(blocks);
+                        var encodeHandle = new TextureExportEncodeHeightsBC4Job
+                        {
+                            heights = Heights,
+                            output = pixels,
+                            minH = minH,
+                            maxH = maxH,
+                            resX = resX,
+                        }.ScheduleBatch(blocks, 256);
+
+                        return ScheduleSaveDdsJob(
+                            ref pixels,
+                            DdsFormat.BC4,
+                            resX,
+                            resY,
+                            path,
+                            ScheduleRelease(encodeHandle)
+                        );
+                    }
+
+                    default:
+                    {
+                        var pixels = AllocatePixels<Color32>(count);
+                        var encodeHandle = new TextureExportEncodeHeightsRGB24Job
+                        {
+                            heights = Heights,
+                            output = pixels,
+                            minH = minH,
+                            maxH = maxH,
+                        }.ScheduleBatch(count, 8192);
+
+                        return ScheduleSaveJob(
+                            ref pixels,
+                            resX,
+                            resY,
+                            path,
+                            ScheduleRelease(encodeHandle)
+                        );
+                    }
+                }
             }
 
             /// <summary>
@@ -983,8 +1037,16 @@ internal static class TextureExporter
 
             if (options.exportNormal)
             {
+                var normalEncoding = options.normalFormat switch
+                {
+                    NormalFormat.DXT5nm => BlockEncoding.DXT5nm,
+                    NormalFormat.BC5 => BlockEncoding.BC5,
+                    _ => (BlockEncoding?)null,
+                };
+
                 var normalHandle = SaveColors(
                     ref normals,
+                    normalEncoding,
                     exportDir,
                     $"{body.name}_Normal{suffix}",
                     handle
@@ -995,6 +1057,7 @@ internal static class TextureExporter
                 {
                     var oceanNormalHandle = SaveColors(
                         ref oceanNormals,
+                        normalEncoding,
                         exportDir,
                         $"{body.name}_Normal_Ocean{suffix}",
                         handle
@@ -1010,8 +1073,17 @@ internal static class TextureExporter
 
             if (options.exportColor)
             {
+                var colorEncoding = options.colorFormat switch
+                {
+                    ColorFormat.DXT1 => BlockEncoding.BC1,
+                    ColorFormat.DXT5 => BlockEncoding.BC3,
+                    ColorFormat.BC7 => BlockEncoding.BC7,
+                    _ => (BlockEncoding?)null,
+                };
+
                 var colorHandle = SaveColors(
                     ref colors,
+                    colorEncoding,
                     exportDir,
                     $"{body.name}_Color{suffix}",
                     handle
@@ -1022,6 +1094,7 @@ internal static class TextureExporter
                 {
                     var oceanColorHandle = SaveColors(
                         ref oceanColors,
+                        colorEncoding,
                         exportDir,
                         $"{body.name}_Color_Ocean{suffix}",
                         handle
@@ -1285,8 +1358,13 @@ internal static class TextureExporter
             );
         }
 
+        /// <summary>
+        /// Writes <paramref name="source"/> as a PNG, or as a DDS compressed with
+        /// <paramref name="encoding"/>. Takes ownership of <paramref name="source"/>.
+        /// </summary>
         JobHandle SaveColors(
             ref NativeArray<Color32> source,
+            BlockEncoding? encoding,
             string exportDir,
             string baseName,
             JobHandle dependsOn = default
@@ -1295,11 +1373,37 @@ internal static class TextureExporter
             int resX = options.Width;
             int resY = options.Height;
 
-            var path = Path.Combine(exportDir, baseName + ".png");
+            if (encoding is not BlockEncoding enc)
+            {
+                var pngPath = Path.Combine(exportDir, baseName + ".png");
+                Debug.Log($"[BurstPQS] Writing {pngPath}");
+
+                return ScheduleSaveJob(ref source, resX, resY, pngPath, dependsOn);
+            }
+
+            var path = Path.Combine(exportDir, baseName + ".dds");
             Debug.Log($"[BurstPQS] Writing {path}");
 
-            var handle = ScheduleSaveJob(source, resX, resY, path, dependsOn);
-            return source.Dispose(handle);
+            int blocks = resX * resY / 16;
+            var compressed = AllocatePixels<byte>(blocks * enc.BytesPerBlock());
+            var handle = new TextureExportCompressJob
+            {
+                pixels = source,
+                output = compressed,
+                encoding = enc,
+                resX = resX,
+            }.ScheduleBatch(blocks, 64, dependsOn);
+            handle = source.Dispose(handle);
+
+            var format = enc switch
+            {
+                BlockEncoding.BC1 => DdsFormat.BC1,
+                BlockEncoding.BC5 => DdsFormat.BC5,
+                BlockEncoding.BC7 => DdsFormat.BC7,
+                _ => DdsFormat.BC3,
+            };
+
+            return ScheduleSaveDdsJob(ref compressed, format, resX, resY, path, handle);
         }
 
         public void Dispose()
@@ -1327,8 +1431,13 @@ internal static class TextureExporter
     #endregion
 
     #region File I/O
+    static NativeArray<T> AllocatePixels<T>(int length)
+        where T : struct =>
+        new(length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+
+    /// <summary>Takes ownership of <paramref name="pixels"/>.</summary>
     static JobHandle ScheduleSaveJob(
-        NativeArray<Color32> pixels,
+        ref NativeArray<Color32> pixels,
         int resX,
         int resY,
         string path,
@@ -1345,27 +1454,33 @@ internal static class TextureExporter
             path = pathHandle,
         }.Schedule(dependency);
 
-        return pathHandle.Dispose(handle);
+        handle = pathHandle.Dispose(handle);
+        return pixels.Dispose(handle);
     }
 
-    static JobHandle ScheduleSaveDdsR16Job(
-        NativeArray<ushort> pixels,
+    /// <summary>Takes ownership of <paramref name="data"/>.</summary>
+    static JobHandle ScheduleSaveDdsJob<T>(
+        ref NativeArray<T> data,
+        DdsFormat format,
         int resX,
         int resY,
         string path,
         JobHandle dependency
     )
+        where T : struct
     {
         var pathHandle = new ObjectHandle<string>(path);
-        var handle = new SaveDdsR16Job
+        var handle = new SaveDdsJob
         {
-            pixels = pixels,
+            data = data.Reinterpret<byte>(UnsafeUtility.SizeOf<T>()),
+            format = format,
             resX = resX,
             resY = resY,
             path = pathHandle,
         }.Schedule(dependency);
 
-        return pathHandle.Dispose(handle);
+        handle = pathHandle.Dispose(handle);
+        return data.Dispose(handle);
     }
 
     /// <summary>
@@ -1397,78 +1512,157 @@ internal static class TextureExporter
         }
     }
 
+    enum DdsFormat
+    {
+        R8,
+        R16,
+        BC1,
+        BC3,
+        BC4,
+        BC5,
+        BC7,
+    }
+
     /// <summary>
-    /// Writes R16 height data as an uncompressed DDS file.
-    /// DDS is used because PNG does not support single-channel 16-bit.
+    /// Writes already-encoded pixel data to disk as a single-mip DDS file. Not burst-compiled
+    /// since it calls managed I/O APIs.
     /// </summary>
-    struct SaveDdsR16Job : IJob
+    /// <remarks>
+    /// Rows are written in the order they are stored, which is how KSP lays out its own DDS
+    /// textures.
+    /// </remarks>
+    unsafe struct SaveDdsJob : IJob
     {
         [ReadOnly]
-        public NativeArray<ushort> pixels;
+        public NativeArray<byte> data;
+
+        public DdsFormat format;
 
         public int resX;
         public int resY;
 
         public ObjectHandle<string> path;
 
-        // DDS constants
         const uint DdsMagic = 0x20534444; // "DDS "
         const uint DdsHeaderSize = 124;
         const uint DdsPixelFormatSize = 32;
-        const uint DdsfCaps = 0x1;
-        const uint DdsfHeight = 0x2;
-        const uint DdsfWidth = 0x4;
-        const uint DdsfPixelFormat = 0x1000;
-        const uint DdsfLinearSize = 0x80000;
+        const uint DdsdCaps = 0x1;
+        const uint DdsdHeight = 0x2;
+        const uint DdsdWidth = 0x4;
+        const uint DdsdPitch = 0x8;
+        const uint DdsdPixelFormat = 0x1000;
+        const uint DdsdLinearSize = 0x80000;
+        const uint DdpfFourCC = 0x4;
         const uint DdpfLuminance = 0x20000;
         const uint DdsCapsTexture = 0x1000;
 
+        const uint DxgiFormatBC7UNorm = 98;
+        const uint D3D10ResourceDimensionTexture2D = 3;
+
+        static uint FourCC(string code) =>
+            code[0] | (uint)code[1] << 8 | (uint)code[2] << 16 | (uint)code[3] << 24;
+
         public void Execute()
         {
-            int dataSize = resX * resY * 2;
-            int headerSize = 4 + (int)DdsHeaderSize; // magic + header
-            var buffer = new byte[headerSize + dataSize];
-
-            using (var stream = new MemoryStream(buffer))
-            using (var writer = new BinaryWriter(stream))
+            bool compressed = format is not (DdsFormat.R8 or DdsFormat.R16);
+            uint pitchOrLinearSize = format switch
             {
-                // Magic
-                writer.Write(DdsMagic);
+                DdsFormat.R8 => (uint)resX,
+                DdsFormat.R16 => (uint)resX * 2,
+                _ => (uint)data.Length,
+            };
 
-                // DDS_HEADER
-                writer.Write(DdsHeaderSize);
-                writer.Write(DdsfCaps | DdsfHeight | DdsfWidth | DdsfPixelFormat | DdsfLinearSize);
-                writer.Write((uint)resY); // height
-                writer.Write((uint)resX); // width
-                writer.Write((uint)dataSize); // pitchOrLinearSize
-                writer.Write(0u); // depth
-                writer.Write(0u); // mipMapCount
-                for (int i = 0; i < 11; i++)
-                    writer.Write(0u); // reserved
+            using var stream = new FileStream(
+                path.Target,
+                FileMode.Create,
+                FileAccess.Write,
+                FileShare.None,
+                1 << 16
+            );
+            using var writer = new BinaryWriter(stream);
 
-                // DDS_PIXELFORMAT
-                writer.Write(DdsPixelFormatSize);
-                writer.Write(DdpfLuminance);
-                writer.Write(0u); // fourCC
-                writer.Write(16u); // rgbBitCount
-                writer.Write(0x0000FFFFu); // rBitMask
-                writer.Write(0u); // gBitMask
-                writer.Write(0u); // bBitMask
-                writer.Write(0u); // aBitMask
+            writer.Write(DdsMagic);
 
-                // Caps
-                writer.Write(DdsCapsTexture);
-                writer.Write(0u); // caps2
-                writer.Write(0u); // caps3
-                writer.Write(0u); // caps4
-                writer.Write(0u); // reserved2
+            // DDS_HEADER
+            writer.Write(DdsHeaderSize);
+            writer.Write(
+                DdsdCaps
+                    | DdsdHeight
+                    | DdsdWidth
+                    | DdsdPixelFormat
+                    | (compressed ? DdsdLinearSize : DdsdPitch)
+            );
+            writer.Write((uint)resY);
+            writer.Write((uint)resX);
+            writer.Write(pitchOrLinearSize);
+            writer.Write(0u); // depth
+            writer.Write(0u); // mipMapCount
+            for (int i = 0; i < 11; i++)
+                writer.Write(0u); // reserved
 
-                // Pixel data
-                for (int i = 0; i < pixels.Length; i++)
-                    writer.Write(pixels[i]);
+            // DDS_PIXELFORMAT
+            writer.Write(DdsPixelFormatSize);
+            switch (format)
+            {
+                case DdsFormat.R8:
+                    WriteLuminanceFormat(writer, 8, 0xFF);
+                    break;
+
+                case DdsFormat.R16:
+                    WriteLuminanceFormat(writer, 16, 0xFFFF);
+                    break;
+
+                default:
+                    var fourCC = format switch
+                    {
+                        DdsFormat.BC1 => "DXT1",
+                        DdsFormat.BC3 => "DXT5",
+                        DdsFormat.BC4 => "ATI1",
+                        DdsFormat.BC5 => "ATI2",
+                        _ => "DX10",
+                    };
+
+                    writer.Write(DdpfFourCC);
+                    writer.Write(FourCC(fourCC));
+                    for (int i = 0; i < 5; i++)
+                        writer.Write(0u); // rgbBitCount and masks
+                    break;
             }
 
-            File.WriteAllBytes(path.Target, buffer);
+            writer.Write(DdsCapsTexture);
+            writer.Write(0u); // caps2
+            writer.Write(0u); // caps3
+            writer.Write(0u); // caps4
+            writer.Write(0u); // reserved2
+
+            // BC7 has no legacy FourCC, so it needs the DX10 extension header.
+            if (format == DdsFormat.BC7)
+            {
+                writer.Write(DxgiFormatBC7UNorm);
+                writer.Write(D3D10ResourceDimensionTexture2D);
+                writer.Write(0u); // miscFlag
+                writer.Write(1u); // arraySize
+                writer.Write(0u); // miscFlags2
+            }
+
+            writer.Flush();
+
+            using var source = new UnmanagedMemoryStream(
+                (byte*)data.GetUnsafeReadOnlyPtr(),
+                data.Length
+            );
+            source.CopyTo(stream, 1 << 20);
+        }
+
+        static void WriteLuminanceFormat(BinaryWriter writer, uint bits, uint mask)
+        {
+            writer.Write(DdpfLuminance);
+            writer.Write(0u); // fourCC
+            writer.Write(bits);
+            writer.Write(mask); // rBitMask
+            writer.Write(0u); // gBitMask
+            writer.Write(0u); // bBitMask
+            writer.Write(0u); // aBitMask
         }
     }
     #endregion

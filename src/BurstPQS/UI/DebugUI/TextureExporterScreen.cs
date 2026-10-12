@@ -22,7 +22,13 @@ internal class TextureExporterScreen : MonoBehaviour
     Toggle _exportNormal;
 
     [SerializeField]
-    Toggle _heightR16;
+    TMP_Dropdown _heightFormatDropdown;
+
+    [SerializeField]
+    TMP_Dropdown _colorFormatDropdown;
+
+    [SerializeField]
+    TMP_Dropdown _normalFormatDropdown;
 
     [SerializeField]
     Toggle _orientNorthUp;
@@ -112,14 +118,9 @@ internal class TextureExporterScreen : MonoBehaviour
         );
 
         // Export options
-        _exportHeight = DebugUIManager.CreateToggle(parent, "Export Height Map");
-        _exportHeight.isOn = true;
-        _heightR16 = DebugUIManager.CreateToggle(parent, "  16-bit Height (R16 DDS)");
-        _heightR16.isOn = false;
-        _exportColor = DebugUIManager.CreateToggle(parent, "Export Color Map");
-        _exportColor.isOn = true;
-        _exportNormal = DebugUIManager.CreateToggle(parent, "Export Normal Map");
-        _exportNormal.isOn = true;
+        _exportHeight = CreateExportRow(parent, "Export Height Map", out _heightFormatDropdown);
+        _exportColor = CreateExportRow(parent, "Export Color Map", out _colorFormatDropdown);
+        _exportNormal = CreateExportRow(parent, "Export Normal Map", out _normalFormatDropdown);
 
         var northUpRow = DebugUIManager.CreateHorizontalLayout(parent);
         northUpRow.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = false;
@@ -160,6 +161,19 @@ internal class TextureExporterScreen : MonoBehaviour
         _projectionDropdown.AddOptions(["Equirectangular", "Cubemap"]);
         _projectionDropdown.value = 0;
         _projectionDropdown.RefreshShownValue();
+
+        SetOptions(_heightFormatDropdown, ["PNG", "R8 DDS", "R16 DDS", "BC4 DDS"]);
+        SetOptions(_colorFormatDropdown, ["PNG", "DXT1 DDS", "DXT5 DDS", "BC7 DDS"]);
+        SetOptions(_normalFormatDropdown, ["PNG", "DXT5nm DDS", "BC5 DDS"]);
+    }
+
+    // Option order matches the declaration order of the corresponding format enum.
+    static void SetOptions(TMP_Dropdown dropdown, List<string> options)
+    {
+        dropdown.ClearOptions();
+        dropdown.AddOptions(options);
+        dropdown.value = 0;
+        dropdown.RefreshShownValue();
     }
 
     // The screen instance is reused across scenes, so the body list refreshes on every open.
@@ -201,6 +215,9 @@ internal class TextureExporterScreen : MonoBehaviour
         _exportCurrentButton.interactable = !exporting;
         _exportAllButton.interactable = !exporting;
         _projectionDropdown.interactable = !exporting;
+        _heightFormatDropdown.interactable = !exporting;
+        _colorFormatDropdown.interactable = !exporting;
+        _normalFormatDropdown.interactable = !exporting;
         _planetDropdown.interactable = !exporting && _bodies is { Count: > 0 };
     }
 
@@ -219,8 +236,9 @@ internal class TextureExporterScreen : MonoBehaviour
             exportHeight = _exportHeight != null && _exportHeight.isOn,
             exportColor = _exportColor != null && _exportColor.isOn,
             exportNormal = _exportNormal != null && _exportNormal.isOn,
-            heightFormat =
-                _heightR16 != null && _heightR16.isOn ? HeightFormat.R16 : HeightFormat.RGB24,
+            heightFormat = (HeightFormat)_heightFormatDropdown.value,
+            colorFormat = (ColorFormat)_colorFormatDropdown.value,
+            normalFormat = (NormalFormat)_normalFormatDropdown.value,
             orientNorthUp = _orientNorthUp != null && _orientNorthUp.isOn,
         };
     }
@@ -254,6 +272,22 @@ internal class TextureExporterScreen : MonoBehaviour
     }
 
     #region UI Helpers
+    static Toggle CreateExportRow(Transform parent, string label, out TMP_Dropdown format)
+    {
+        var row = DebugUIManager.CreateHorizontalLayout(parent);
+        row.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = false;
+
+        var toggle = DebugUIManager.CreateToggle(row.transform, label);
+        toggle.isOn = true;
+
+        format = DebugUIManager.CreateDropdown(row.transform);
+        var layout = format.GetComponent<LayoutElement>();
+        layout.preferredWidth = 140f;
+        layout.flexibleWidth = 0f;
+
+        return toggle;
+    }
+
     static void CreateSeparator(Transform parent)
     {
         var go = new GameObject("Separator", typeof(RectTransform));
