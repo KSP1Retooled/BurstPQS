@@ -792,7 +792,6 @@ public class BatchPQS : MonoBehaviour
                         worldPosition = BurstUtil.ConvertVector(
                             (Vector3d)camera.mainCamera.transform.position
                         ),
-                        surfaceRadius = pqs.targetDistance - pqs.targetHeight,
                         surfaceSpeed = activeVessel != null ? activeVessel.srfSpeed : 0.0,
                     }
                 );
@@ -807,7 +806,6 @@ public class BatchPQS : MonoBehaviour
                     new SubdivisionTargetInput
                     {
                         worldPosition = BurstUtil.ConvertVector(vessel.GetWorldPos3D()),
-                        surfaceRadius = pqs.radius + vessel.terrainAltitude,
                         surfaceSpeed = vessel.srfSpeed,
                         colliderLevel = colliderLevel,
                         vesselRadius = GetVesselRadius(vessel),
@@ -829,8 +827,12 @@ public class BatchPQS : MonoBehaviour
         {
             primary = new SubdivisionTarget
             {
+                // UpdateVisual overwrites relativeTargetPosition with the
+                // point on the sphere below the target.
+                position = BurstUtil.ConvertVector(
+                    pqs.relativeTargetPositionNormalized * pqs.targetDistance
+                ),
                 directionNormalized = BurstUtil.ConvertVector(pqs.relativeTargetPositionNormalized),
-                absHeight = Math.Abs(pqs.targetHeight),
                 collapseFactor = pqs.collapseThreshold,
                 maxLevelAtSpeed = Math.Max(pqs.maxLevelAtCurrentTgtSpeed, primaryColliderLevel),
                 colliderLevel = primaryColliderLevel,
@@ -879,7 +881,10 @@ public class BatchPQS : MonoBehaviour
     private readonly List<PQ> collapseQuads = [];
     private readonly List<PQ> onUpdateQuads = [];
 
-    internal void InvalidateActiveQuads() => needsQuadRescan = true;
+    internal void InvalidateActiveQuads()
+    {
+        needsQuadRescan = true;
+    }
 
     internal void InvalidateQuadSnapshot(PQ quad)
     {
@@ -940,22 +945,49 @@ public class BatchPQS : MonoBehaviour
         foreach (var quad in quadsToRefresh)
         {
             if (activeQuadIndices.TryGetValue(quad, out var index))
-                snapshots[index] = CreateSnapshot(quad);
+                snapshots[index] = CreateSnapshot(quad, GetBoundsRadius(quad, index));
         }
         quadsToRefresh.Clear();
     }
 
-    static QuadSnapshot CreateSnapshot(PQ q) =>
+    QuadSnapshot CreateSnapshot(PQ q, double boundsRadius) =>
         new()
         {
-            positionPlanetRelative = BurstUtil.ConvertVector(q.positionPlanetRelative),
-            angularInterval = q.angularinterval,
+            positionPlanet = BurstUtil.ConvertVector(q.positionPlanet),
+            boundsRadius = boundsRadius,
             subdivideThresholdFactor = q.subdivideThresholdFactor,
             subdivision = q.subdivision,
             isSubdivided = q.isSubdivided,
             isVisible = q.isVisible,
             hasOnUpdate = q.onUpdate != null,
         };
+
+    // Quads that haven't been built yet are estimated from their parent. A
+    // child covers half its parent's width, so it gets half its radius.
+    double GetBoundsRadius(PQ quad, int index)
+    {
+        var radius = snapshots[index].boundsRadius;
+        if (radius != 0.0)
+            return radius;
+
+        if (quad.parent.IsNullOrDestroyed())
+            return 0.0;
+
+        if (!activeQuadIndices.TryGetValue(quad.parent, out var parentIndex))
+            return 0.0;
+
+        return snapshots[parentIndex].boundsRadius * 0.5;
+    }
+
+    internal void SetBoundsRadius(PQ quad, double radius)
+    {
+        if (!activeQuadIndices.TryGetValue(quad, out var index))
+            return;
+
+        var snapshot = snapshots[index];
+        snapshot.boundsRadius = radius;
+        snapshots[index] = snapshot;
+    }
 
     struct SubdivisionUpdate(BatchPQS batchPQS, List<PQ> activeQuads) : IDisposable
     {
@@ -1458,6 +1490,8 @@ public class BatchPQS : MonoBehaviour
                 quadPlaneTransform = planeTransform,
                 planetToQuad = planetToQuad,
 
+                quadCenter = BurstUtil.ConvertVector(quad.positionPlanet),
+
                 surfaceRelativeQuads = pqs.surfaceRelativeQuads,
                 reqVertexMapCoords = pqs.reqVertexMapCoods,
                 reqCustomNormals = pqs.reqCustomNormals,
@@ -1569,6 +1603,8 @@ public class BatchPQS : MonoBehaviour
             foreach (var mod in batchPQS.mods)
                 mod.OnQuadBuilt(quad);
             pqs.buildQuad = null;
+
+            batchPQS.SetBoundsRadius(quad, meshData.boundsRadius);
 
             // OnQuadBuilt mods may change fields used by the snapshot.
             batchPQS.InvalidateQuadSnapshot(quad);

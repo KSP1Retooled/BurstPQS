@@ -8,7 +8,6 @@ namespace BurstPQS.Jobs;
 struct SubdivisionTargetInput
 {
     public double3 worldPosition;
-    public double surfaceRadius;
     public double surfaceSpeed;
     public int colliderLevel;
     public double vesselRadius;
@@ -56,8 +55,8 @@ struct PrepareSubdivisionTargetsJob : IJob
             targets.Add(
                 new SubdivisionTarget
                 {
+                    position = position,
                     directionNormalized = position / distance,
-                    absHeight = math.abs(distance - input.surfaceRadius),
                     collapseFactor = GetCollapseFactor(altitude),
                     maxLevelAtSpeed = math.max(
                         GetMaxLevelAtSpeed(angularSpeed),

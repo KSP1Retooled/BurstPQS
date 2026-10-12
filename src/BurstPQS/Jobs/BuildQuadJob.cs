@@ -33,6 +33,8 @@ internal struct BuildQuadJob : IJob
     // must be applied in doubles since the vertices are planet-radius sized.
     public double4x4 planetToQuad;
 
+    public double3 quadCenter;
+
     public bool surfaceRelativeQuads;
     public bool reqVertexMapCoords;
     public bool reqCustomNormals;
@@ -385,6 +387,7 @@ internal struct BuildQuadJob : IJob
         }
 
         mesh.bounds = new Bounds((boundsMin + boundsMax) * 0.5f, boundsMax - boundsMin);
+        mesh.boundsRadius = ComputeBoundsRadius(data.vertsD);
 
         // vertsD: planet-relative positions for PQS cache (not a mesh attribute)
         mesh.vertsD = new NativeArray<Vector3d>(vertexCount, Allocator.Persistent);
@@ -400,6 +403,14 @@ internal struct BuildQuadJob : IJob
             mesh.tangents = new NativeArray<Vector4>(vertexCount, Allocator.Persistent);
             mesh.tangents.CopyFrom(data.tangents.AsNativeArray());
         }
+    }
+
+    readonly double ComputeBoundsRadius(MemorySpan<Vector3d> vertsD)
+    {
+        var radiusSq = 0.0;
+        foreach (var vert in vertsD)
+            radiusSq = math.max(radiusSq, math.distancesq(BurstUtil.ConvertVector(vert), quadCenter));
+        return math.sqrt(radiusSq);
     }
 
     readonly void BuildMeshNormals(in BuildMeshData data, NativeArray<int> indices)

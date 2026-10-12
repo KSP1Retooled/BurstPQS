@@ -29,6 +29,7 @@ internal struct MeshDataStruct : IDisposable
     public NativeArray<Vector4> tangents; // stream 2 (conditional)
     // uv1 is uploaded from cacheUV2s as the stream after tangents
     public Bounds bounds;
+    public double boundsRadius;
 
     // PQS cache arrays (deinterleaved on worker thread)
     public NativeArray<Vector3d> vertsD;
@@ -73,6 +74,7 @@ internal class MeshData : IDisposable
     public NativeArray<Vector3> normals => data.normals;
     public NativeArray<Vector4> tangents => data.tangents;
     public Bounds bounds => data.bounds;
+    public double boundsRadius => data.boundsRadius;
 
     public NativeArray<Vector3d> vertsD => data.vertsD;
     public NativeArray<Color> cacheColors => data.cacheColors;

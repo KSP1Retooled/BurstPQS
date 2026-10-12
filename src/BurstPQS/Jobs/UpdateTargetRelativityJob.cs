@@ -11,8 +11,8 @@ namespace BurstPQS.Jobs;
 
 struct QuadSnapshot
 {
-    public double3 positionPlanetRelative;
-    public double angularInterval;
+    public double3 positionPlanet;
+    public double boundsRadius;
     public double subdivideThresholdFactor;
     public int subdivision;
     public bool isSubdivided;
@@ -28,8 +28,8 @@ struct QuadResult
 
 struct SubdivisionTarget
 {
+    public double3 position;
     public double3 directionNormalized;
-    public double absHeight;
     public double collapseFactor;
     public int maxLevelAtSpeed;
     public int colliderLevel;
@@ -74,6 +74,7 @@ struct ComputeSubdivisionJob : IJobParallelForBatch
         for (int i = start; i < end; i++)
         {
             var snap = snapshots[i];
+            var direction = math.normalize(snap.positionPlanet);
 
             // A quad subdivides if any target wants it to, and only collapses
             // once every target agrees.
@@ -86,10 +87,11 @@ struct ComputeSubdivisionJob : IJobParallelForBatch
             {
                 var target = targets[t];
                 var g =
-                    math.acos(math.dot(snap.positionPlanetRelative, target.directionNormalized))
+                    math.acos(math.dot(direction, target.directionNormalized))
                     * radius
                     * GreatCircleScale;
-                var gcDist = g + target.absHeight - snap.angularInterval;
+                var gcDist =
+                    math.distance(target.position, snap.positionPlanet) - snap.boundsRadius;
 
                 minG = math.min(minG, g);
                 minGcDist = math.min(minGcDist, gcDist);
