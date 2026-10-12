@@ -146,6 +146,104 @@ internal struct TextureExportEncodeHeightsR16Job : IJobParallelForBatch
 }
 
 /// <summary>
+/// Box-filters a float texture down to its next mip level. Each batch element is one output
+/// row.
+/// </summary>
+[BurstCompile]
+internal struct TextureExportDownsampleFloatJob : IJobParallelForBatch
+{
+    [ReadOnly]
+    public NativeArray<float> source;
+
+    [WriteOnly]
+    public NativeArray<float> output;
+
+    public int srcX;
+    public int srcY;
+    public int dstX;
+    public int dstY;
+
+    public void Execute(int start, int count)
+    {
+        int end = start + count;
+        for (int y = start; y < end; y++)
+        {
+            // Each output pixel averages every source pixel it covers, so an odd-sized level
+            // folds its last row or column into its neighbours.
+            int y0 = y * srcY / dstY;
+            int y1 = (y + 1) * srcY / dstY;
+            for (int x = 0; x < dstX; x++)
+            {
+                int x0 = x * srcX / dstX;
+                int x1 = (x + 1) * srcX / dstX;
+
+                float sum = 0f;
+                for (int sy = y0; sy < y1; sy++)
+                {
+                    for (int sx = x0; sx < x1; sx++)
+                        sum += source[sy * srcX + sx];
+                }
+
+                output[y * dstX + x] = sum / ((y1 - y0) * (x1 - x0));
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Box-filters a Color32 texture down to its next mip level. Each batch element is one output
+/// row.
+/// </summary>
+[BurstCompile]
+internal struct TextureExportDownsampleColor32Job : IJobParallelForBatch
+{
+    [ReadOnly]
+    public NativeArray<Color32> source;
+
+    [WriteOnly]
+    public NativeArray<Color32> output;
+
+    public int srcX;
+    public int srcY;
+    public int dstX;
+    public int dstY;
+
+    public void Execute(int start, int count)
+    {
+        int end = start + count;
+        for (int y = start; y < end; y++)
+        {
+            int y0 = y * srcY / dstY;
+            int y1 = (y + 1) * srcY / dstY;
+            for (int x = 0; x < dstX; x++)
+            {
+                int x0 = x * srcX / dstX;
+                int x1 = (x + 1) * srcX / dstX;
+
+                int4 sum = 0;
+                for (int sy = y0; sy < y1; sy++)
+                {
+                    for (int sx = x0; sx < x1; sx++)
+                    {
+                        var c = source[sy * srcX + sx];
+                        sum += new int4(c.r, c.g, c.b, c.a);
+                    }
+                }
+
+                int n = (y1 - y0) * (x1 - x0);
+                var avg = (sum + n / 2) / n;
+                output[y * dstX + x] = new Color32(
+                    (byte)avg.x,
+                    (byte)avg.y,
+                    (byte)avg.z,
+                    (byte)avg.w
+                );
+            }
+        }
+    }
+}
+
+/// <summary>
 /// Flips a float texture vertically by swapping rows. Each batch element is a row index
 /// in the top half; the job swaps it with the corresponding row from the bottom half.
 /// </summary>

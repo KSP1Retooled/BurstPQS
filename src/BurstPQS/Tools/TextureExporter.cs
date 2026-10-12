@@ -500,92 +500,134 @@ internal static class TextureExporter
                 string path = outputPath + (format == HeightFormat.Png ? ".png" : ".dds");
                 Debug.Log($"[BurstPQS] Writing {path}");
 
+                if (format == HeightFormat.Png)
+                {
+                    var pixels = AllocatePixels<Color32>(count);
+                    var encodeHandle = new TextureExportEncodeHeightsRGB24Job
+                    {
+                        heights = Heights,
+                        output = pixels,
+                        minH = minH,
+                        maxH = maxH,
+                    }.ScheduleBatch(count, 8192);
+
+                    return ScheduleSaveJob(
+                        ref pixels,
+                        resX,
+                        resY,
+                        path,
+                        ScheduleRelease(encodeHandle)
+                    );
+                }
+
+                var ddsFormat = format switch
+                {
+                    HeightFormat.R8 => DdsFormat.R8,
+                    HeightFormat.R16 => DdsFormat.R16,
+                    _ => DdsFormat.BC4,
+                };
+
+                int mipCount = MipCount(resX, resY);
+                var output = AllocatePixels<byte>(MipChainBytes(ddsFormat, resX, resY, mipCount));
+                var level = Heights;
+                JobHandle handle = default;
+                int offset = 0;
+
+                // Everything runs as one chain, since combining handles over a full-size encode
+                // runs into the same JobTempAlloc lifetime as ScheduleRelease below.
+                for (int mip = 0; mip < mipCount; mip++)
+                {
+                    int w = MipSize(resX, mip);
+                    int h = MipSize(resY, mip);
+
+                    var next = default(NativeArray<float>);
+                    if (mip + 1 < mipCount)
+                    {
+                        int nextW = MipSize(resX, mip + 1);
+                        int nextH = MipSize(resY, mip + 1);
+                        next = AllocatePixels<float>(nextW * nextH);
+                        handle = new TextureExportDownsampleFloatJob
+                        {
+                            source = level,
+                            output = next,
+                            srcX = w,
+                            srcY = h,
+                            dstX = nextW,
+                            dstY = nextH,
+                        }.ScheduleBatch(nextH, 16, handle);
+                    }
+
+                    int bytes = MipLevelBytes(ddsFormat, w, h);
+                    handle = ScheduleEncode(
+                        format,
+                        level,
+                        output.GetSubArray(offset, bytes),
+                        w,
+                        h,
+                        minH,
+                        maxH,
+                        handle
+                    );
+                    offset += bytes;
+
+                    handle = mip == 0 ? ScheduleRelease(handle) : level.Dispose(handle);
+                    level = next;
+                }
+
+                return ScheduleSaveDdsJob(
+                    ref output,
+                    ddsFormat,
+                    resX,
+                    resY,
+                    mipCount,
+                    path,
+                    handle
+                );
+            }
+
+            static JobHandle ScheduleEncode(
+                HeightFormat format,
+                NativeArray<float> heights,
+                NativeArray<byte> output,
+                int resX,
+                int resY,
+                float minH,
+                float maxH,
+                JobHandle dependsOn
+            )
+            {
+                int count = resX * resY;
                 switch (format)
                 {
                     case HeightFormat.R8:
-                    {
-                        var pixels = AllocatePixels<byte>(count);
-                        var encodeHandle = new TextureExportEncodeHeightsR8Job
+                        return new TextureExportEncodeHeightsR8Job
                         {
-                            heights = Heights,
-                            output = pixels,
+                            heights = heights,
+                            output = output,
                             minH = minH,
                             maxH = maxH,
-                        }.ScheduleBatch(count, 8192);
-
-                        return ScheduleSaveDdsJob(
-                            ref pixels,
-                            DdsFormat.R8,
-                            resX,
-                            resY,
-                            path,
-                            ScheduleRelease(encodeHandle)
-                        );
-                    }
+                        }.ScheduleBatch(count, 8192, dependsOn);
 
                     case HeightFormat.R16:
-                    {
-                        var pixels = AllocatePixels<ushort>(count);
-                        var encodeHandle = new TextureExportEncodeHeightsR16Job
+                        return new TextureExportEncodeHeightsR16Job
                         {
-                            heights = Heights,
-                            output = pixels,
+                            heights = heights,
+                            output = output.Reinterpret<ushort>(sizeof(byte)),
                             minH = minH,
                             maxH = maxH,
-                        }.ScheduleBatch(count, 8192);
+                        }.ScheduleBatch(count, 8192, dependsOn);
 
-                        return ScheduleSaveDdsJob(
-                            ref pixels,
-                            DdsFormat.R16,
-                            resX,
-                            resY,
-                            path,
-                            ScheduleRelease(encodeHandle)
-                        );
-                    }
-
-                    case HeightFormat.BC4:
-                    {
-                        int blocks = count / 16;
-                        var pixels = AllocatePixels<ulong>(blocks);
-                        var encodeHandle = new TextureExportEncodeHeightsBC4Job
+                    default:
+                        int blocks = BlockCount(resX, resY);
+                        return new TextureExportEncodeHeightsBC4Job
                         {
-                            heights = Heights,
-                            output = pixels,
+                            heights = heights,
+                            output = output.Reinterpret<ulong>(sizeof(byte)),
                             minH = minH,
                             maxH = maxH,
                             resX = resX,
-                        }.ScheduleBatch(blocks, 256);
-
-                        return ScheduleSaveDdsJob(
-                            ref pixels,
-                            DdsFormat.BC4,
-                            resX,
-                            resY,
-                            path,
-                            ScheduleRelease(encodeHandle)
-                        );
-                    }
-
-                    default:
-                    {
-                        var pixels = AllocatePixels<Color32>(count);
-                        var encodeHandle = new TextureExportEncodeHeightsRGB24Job
-                        {
-                            heights = Heights,
-                            output = pixels,
-                            minH = minH,
-                            maxH = maxH,
-                        }.ScheduleBatch(count, 8192);
-
-                        return ScheduleSaveJob(
-                            ref pixels,
-                            resX,
-                            resY,
-                            path,
-                            ScheduleRelease(encodeHandle)
-                        );
-                    }
+                            resY = resY,
+                        }.ScheduleBatch(blocks, 256, dependsOn);
                 }
             }
 
@@ -1386,17 +1428,6 @@ internal static class TextureExporter
             var path = Path.Combine(exportDir, baseName + ".dds");
             Debug.Log($"[BurstPQS] Writing {path}");
 
-            int blocks = resX * resY / 16;
-            var compressed = AllocatePixels<byte>(blocks * enc.BytesPerBlock());
-            var handle = new TextureExportCompressJob
-            {
-                pixels = source,
-                output = compressed,
-                encoding = enc,
-                resX = resX,
-            }.ScheduleBatch(blocks, 64, dependsOn);
-            handle = source.Dispose(handle);
-
             var format = enc switch
             {
                 BlockEncoding.BC1 => DdsFormat.BC1,
@@ -1405,7 +1436,60 @@ internal static class TextureExporter
                 _ => DdsFormat.BC3,
             };
 
-            return ScheduleSaveDdsJob(ref compressed, format, resX, resY, path, handle);
+            int mipCount = MipCount(resX, resY);
+            var compressed = AllocatePixels<byte>(MipChainBytes(format, resX, resY, mipCount));
+            var level = source;
+            source = default;
+            var handle = dependsOn;
+            int offset = 0;
+
+            // A single chain, for the same JobTempAlloc reason as the heights.
+            for (int mip = 0; mip < mipCount; mip++)
+            {
+                int w = MipSize(resX, mip);
+                int h = MipSize(resY, mip);
+
+                var next = default(NativeArray<Color32>);
+                if (mip + 1 < mipCount)
+                {
+                    int nextW = MipSize(resX, mip + 1);
+                    int nextH = MipSize(resY, mip + 1);
+                    next = AllocatePixels<Color32>(nextW * nextH);
+                    handle = new TextureExportDownsampleColor32Job
+                    {
+                        source = level,
+                        output = next,
+                        srcX = w,
+                        srcY = h,
+                        dstX = nextW,
+                        dstY = nextH,
+                    }.ScheduleBatch(nextH, 16, handle);
+                }
+
+                int bytes = MipLevelBytes(format, w, h);
+                handle = new TextureExportCompressJob
+                {
+                    pixels = level,
+                    output = compressed.GetSubArray(offset, bytes),
+                    encoding = enc,
+                    resX = w,
+                    resY = h,
+                }.ScheduleBatch(BlockCount(w, h), 64, handle);
+                offset += bytes;
+
+                handle = level.Dispose(handle);
+                level = next;
+            }
+
+            return ScheduleSaveDdsJob(
+                ref compressed,
+                format,
+                resX,
+                resY,
+                mipCount,
+                path,
+                handle
+            );
         }
 
         public void Dispose()
@@ -1437,6 +1521,35 @@ internal static class TextureExporter
         where T : struct =>
         new(length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
 
+    static int MipCount(int resX, int resY)
+    {
+        int count = 1;
+        for (int size = Math.Max(resX, resY); size > 1; size >>= 1)
+            count++;
+        return count;
+    }
+
+    static int MipSize(int res, int mip) => Math.Max(1, res >> mip);
+
+    static int BlockCount(int resX, int resY) => (resX + 3) / 4 * ((resY + 3) / 4);
+
+    static int MipLevelBytes(DdsFormat format, int resX, int resY) =>
+        format switch
+        {
+            DdsFormat.R8 => resX * resY,
+            DdsFormat.R16 => resX * resY * 2,
+            DdsFormat.BC1 or DdsFormat.BC4 => BlockCount(resX, resY) * 8,
+            _ => BlockCount(resX, resY) * 16,
+        };
+
+    static int MipChainBytes(DdsFormat format, int resX, int resY, int mipCount)
+    {
+        int bytes = 0;
+        for (int mip = 0; mip < mipCount; mip++)
+            bytes += MipLevelBytes(format, MipSize(resX, mip), MipSize(resY, mip));
+        return bytes;
+    }
+
     /// <summary>Takes ownership of <paramref name="pixels"/>.</summary>
     static JobHandle ScheduleSaveJob(
         ref NativeArray<Color32> pixels,
@@ -1466,6 +1579,7 @@ internal static class TextureExporter
         DdsFormat format,
         int resX,
         int resY,
+        int mipCount,
         string path,
         JobHandle dependency
     )
@@ -1478,6 +1592,7 @@ internal static class TextureExporter
             format = format,
             resX = resX,
             resY = resY,
+            mipCount = mipCount,
             path = pathHandle,
         }.Schedule(dependency);
 
@@ -1526,8 +1641,8 @@ internal static class TextureExporter
     }
 
     /// <summary>
-    /// Writes already-encoded pixel data to disk as a single-mip DDS file. Not burst-compiled
-    /// since it calls managed I/O APIs.
+    /// Writes already-encoded pixel data, holding every mip level back to back, to disk as a DDS
+    /// file. Not burst-compiled since it calls managed I/O APIs.
     /// </summary>
     /// <remarks>
     /// Rows are written in the order they are stored, which is how KSP lays out its own DDS
@@ -1542,6 +1657,7 @@ internal static class TextureExporter
 
         public int resX;
         public int resY;
+        public int mipCount;
 
         public ObjectHandle<string> path;
 
@@ -1553,10 +1669,13 @@ internal static class TextureExporter
         const uint DdsdWidth = 0x4;
         const uint DdsdPitch = 0x8;
         const uint DdsdPixelFormat = 0x1000;
+        const uint DdsdMipMapCount = 0x20000;
         const uint DdsdLinearSize = 0x80000;
         const uint DdpfFourCC = 0x4;
         const uint DdpfLuminance = 0x20000;
+        const uint DdsCapsComplex = 0x8;
         const uint DdsCapsTexture = 0x1000;
+        const uint DdsCapsMipMap = 0x400000;
 
         const uint DxgiFormatBC7UNorm = 98;
         const uint D3D10ResourceDimensionTexture2D = 3;
@@ -1571,7 +1690,7 @@ internal static class TextureExporter
             {
                 DdsFormat.R8 => (uint)resX,
                 DdsFormat.R16 => (uint)resX * 2,
-                _ => (uint)data.Length,
+                _ => (uint)MipLevelBytes(format, resX, resY),
             };
 
             using var stream = new FileStream(
@@ -1592,13 +1711,14 @@ internal static class TextureExporter
                     | DdsdHeight
                     | DdsdWidth
                     | DdsdPixelFormat
+                    | DdsdMipMapCount
                     | (compressed ? DdsdLinearSize : DdsdPitch)
             );
             writer.Write((uint)resY);
             writer.Write((uint)resX);
             writer.Write(pitchOrLinearSize);
             writer.Write(0u); // depth
-            writer.Write(0u); // mipMapCount
+            writer.Write((uint)mipCount);
             for (int i = 0; i < 11; i++)
                 writer.Write(0u); // reserved
 
@@ -1631,7 +1751,7 @@ internal static class TextureExporter
                     break;
             }
 
-            writer.Write(DdsCapsTexture);
+            writer.Write(DdsCapsTexture | DdsCapsComplex | DdsCapsMipMap);
             writer.Write(0u); // caps2
             writer.Write(0u); // caps3
             writer.Write(0u); // caps4

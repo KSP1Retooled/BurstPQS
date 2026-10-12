@@ -32,7 +32,7 @@ internal static class BlockEncodingExt
 
 /// <summary>
 /// Compresses an RGBA texture into 4x4 blocks. Each batch element is one block, numbered
-/// row-major. Both dimensions must be multiples of 4.
+/// row-major.
 /// </summary>
 [BurstCompile]
 internal unsafe struct TextureExportCompressJob : IJobParallelForBatch
@@ -47,6 +47,7 @@ internal unsafe struct TextureExportCompressJob : IJobParallelForBatch
 
     public BlockEncoding encoding;
     public int resX;
+    public int resY;
 
     public void Execute(int start, int count)
     {
@@ -57,7 +58,7 @@ internal unsafe struct TextureExportCompressJob : IJobParallelForBatch
 
         for (int block = start; block < end; block++)
         {
-            LoadBlock(pixels, resX, block, px);
+            LoadBlock(pixels, resX, resY, block, px);
 
             switch (encoding)
             {
@@ -110,18 +111,19 @@ internal unsafe struct TextureExportCompressJob : IJobParallelForBatch
         }
     }
 
-    static void LoadBlock(NativeArray<Color32> pixels, int resX, int block, float4* dst)
+    static void LoadBlock(NativeArray<Color32> pixels, int resX, int resY, int block, float4* dst)
     {
-        int blocksX = resX / 4;
+        int blocksX = (resX + 3) / 4;
         int x0 = block % blocksX * 4;
         int y0 = block / blocksX * 4;
 
+        // Small mip levels can end partway through a block, so the edge pixels fill the rest.
         for (int y = 0; y < 4; y++)
         {
-            int row = (y0 + y) * resX + x0;
+            int row = math.min(y0 + y, resY - 1) * resX;
             for (int x = 0; x < 4; x++)
             {
-                var c = pixels[row + x];
+                var c = pixels[row + math.min(x0 + x, resX - 1)];
                 dst[y * 4 + x] = new float4(c.r, c.g, c.b, c.a);
             }
         }
@@ -144,11 +146,12 @@ internal unsafe struct TextureExportEncodeHeightsBC4Job : IJobParallelForBatch
     public float minH;
     public float maxH;
     public int resX;
+    public int resY;
 
     public void Execute(int start, int count)
     {
         var values = stackalloc float[16];
-        int blocksX = resX / 4;
+        int blocksX = (resX + 3) / 4;
         int end = start + count;
 
         float range = maxH - minH;
@@ -161,9 +164,13 @@ internal unsafe struct TextureExportEncodeHeightsBC4Job : IJobParallelForBatch
 
             for (int y = 0; y < 4; y++)
             {
-                int row = (y0 + y) * resX + x0;
+                int row = math.min(y0 + y, resY - 1) * resX;
                 for (int x = 0; x < 4; x++)
-                    values[y * 4 + x] = math.clamp((heights[row + x] - minH) * scale, 0f, 255f);
+                {
+                    int col = math.min(x0 + x, resX - 1);
+                    float h = heights[row + col];
+                    values[y * 4 + x] = math.clamp((h - minH) * scale, 0f, 255f);
+                }
             }
 
             output[block] = BC4.Encode(values);
