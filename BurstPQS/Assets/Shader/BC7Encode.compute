@@ -1,5 +1,5 @@
-// BC7 encoder covering modes 1, 3, 6 and 7. A port of BurstPQS.Util.Textures.BC7, one thread
-// per 4x4 block.
+// BC7 encoder covering modes 1, 3, 6 and 7. A port of BurstPQS.Util.Textures.BC7, with each
+// 4x4 block spread over several threads.
 //
 // EncodeBC7Fast follows bc7e's fastest preset, which only tries mode 6.
 
@@ -283,17 +283,30 @@ Mode GetMode(int number)
     return mode;
 }
 
-struct Endpoint
+// An endpoint's stored bits, 7 per channel from the low end, then its p-bit at bit 28. Packed
+// to keep the candidates small, since they stay live through every fit.
+typedef uint Endpoint;
+
+Endpoint MakeEndpoint(int4 bits, int pbit)
 {
-    int4 bits;
-    int pbit;
-    int4 value;
-};
+    uint4 b = (uint4)bits;
+    return b.x | b.y << 7 | b.z << 14 | b.w << 21 | (uint)pbit << 28;
+}
+
+int4 EndpointBits(Endpoint e)
+{
+    return (int4)((e >> uint4(0, 7, 14, 21)) & 0x7F);
+}
+
+int EndpointPBit(Endpoint e)
+{
+    return e >> 28;
+}
 
 // Indices hold 4 bits per pixel, whatever the mode's index size: pixels 0-7 in x, 8-15 in y.
 struct Candidate
 {
-    Mode mode;
+    int number;
     uint shape;
     float error;
 
@@ -322,20 +335,11 @@ struct SubsetFit
     float error;
 };
 
-Endpoint ZeroEndpoint()
-{
-    Endpoint e;
-    e.bits = 0;
-    e.pbit = 0;
-    e.value = 0;
-    return e;
-}
-
 SubsetFit EmptyFit()
 {
     SubsetFit fit;
-    fit.start = ZeroEndpoint();
-    fit.end = ZeroEndpoint();
+    fit.start = 0;
+    fit.end = 0;
     fit.indices = 0;
     fit.error = INFINITY;
     return fit;
@@ -366,6 +370,16 @@ uint SolidEndpoint(int i)
 int4 Expand(int4 value, int bits)
 {
     return value << (8 - bits) | value >> (2 * bits - 8);
+}
+
+// What the decoder makes of an endpoint. Alpha has either the colour's bits or none, so every
+// channel can share them, and the modes without alpha always decode it as 255.
+int4 EndpointValue(Endpoint e, Mode mode)
+{
+    int4 value = Expand(EndpointBits(e) << 1 | EndpointPBit(e), mode.colorBits + 1);
+    if (mode.alphaBits == 0)
+        value.w = 255;
+    return value;
 }
 
 // The block being encoded, as Color32. A static global is per thread in HLSL, so this is the
@@ -433,53 +447,26 @@ float4 PrincipalAxis(float4x4 cov)
     return axis;
 }
 
-// Picks the partitions whose subsets lie closest to a line each, measured as the variance
-// left over once the principal axis is taken out.
-void RankShapes(out uint shapes[SHAPE_CANDIDATES])
+// How far a partition's subsets are from lying on a line each, measured as the variance left
+// over once the principal axis is taken out. The lowest scoring partitions are tried.
+float ShapeScore(uint shape)
 {
-    float scores[SHAPE_CANDIDATES];
-    for (int i = 0; i < SHAPE_CANDIDATES; i++)
-    {
-        scores[i] = INFINITY;
-        shapes[i] = 0;
-    }
+    uint mask = PartitionMasks[shape];
 
+    float score = 0;
     [loop]
-    for (uint shape = 0; shape < PARTITION_COUNT; shape++)
+    for (uint half = 0; half < 2; half++)
     {
-        uint mask = PartitionMasks[shape];
+        float4 mean;
+        float4x4 cov;
+        Moments(half == 0 ? ~mask & 0xFFFF : mask, false, mean, cov);
 
-        float score = 0;
-        [loop]
-        for (uint half = 0; half < 2; half++)
-        {
-            float4 mean;
-            float4x4 cov;
-            Moments(half == 0 ? ~mask & 0xFFFF : mask, false, mean, cov);
-
-            float4 axis = PrincipalAxis(cov);
-            float trace = cov[0].x + cov[1].y + cov[2].z + cov[3].w;
-            score += trace - dot(axis, mul(cov, axis));
-        }
-
-        // Insertion into the sorted candidate list.
-        int slot = SHAPE_CANDIDATES;
-        while (slot > 0 && score < scores[slot - 1])
-        {
-            if (slot < SHAPE_CANDIDATES)
-            {
-                scores[slot] = scores[slot - 1];
-                shapes[slot] = shapes[slot - 1];
-            }
-            slot--;
-        }
-
-        if (slot < SHAPE_CANDIDATES)
-        {
-            scores[slot] = score;
-            shapes[slot] = shape;
-        }
+        float4 axis = PrincipalAxis(cov);
+        float trace = cov[0].x + cov[1].y + cov[2].z + cov[3].w;
+        score += trace - dot(axis, mul(cov, axis));
     }
+
+    return score;
 }
 
 Subset MakeSubset(uint pixels)
@@ -511,8 +498,7 @@ Endpoint Quantize(float4 e, Mode mode, int pbit)
     int maxValue = (1 << bits) - 1;
     int4 guess = clamp((int4)round((e * ((2 << bits) - 1) / 255.0 - pbit) * 0.5), 0, maxValue);
 
-    Endpoint endpoint = ZeroEndpoint();
-    endpoint.pbit = pbit;
+    int4 best = 0;
     float4 bestErr = INFINITY;
     for (int k = -1; k <= 1; k++)
     {
@@ -523,17 +509,13 @@ Endpoint Quantize(float4 e, Mode mode, int pbit)
         bool4 better = d * d < bestErr;
 
         bestErr = better ? d * d : bestErr;
-        endpoint.bits = better ? c : endpoint.bits;
-        endpoint.value = better ? value : endpoint.value;
+        best = better ? c : best;
     }
 
     if (mode.alphaBits == 0)
-    {
-        endpoint.bits.w = 0;
-        endpoint.value.w = 255;
-    }
+        best.w = 0;
 
-    return endpoint;
+    return MakeEndpoint(best, pbit);
 }
 
 // Picks the nearest palette entry for each pixel in the subset. Every distance is a whole
@@ -541,6 +523,8 @@ Endpoint Quantize(float4 e, Mode mode, int pbit)
 bool Evaluate(Subset s, Mode mode, Endpoint start, Endpoint end, inout SubsetFit fit)
 {
     uint count = 1u << mode.indexBits;
+    int4 startValue = EndpointValue(start, mode);
+    int4 endValue = EndpointValue(end, mode);
 
     // Packed like the pixels, to keep the array small.
     uint palette[16];
@@ -548,7 +532,7 @@ bool Evaluate(Subset s, Mode mode, Endpoint start, Endpoint end, inout SubsetFit
     for (uint j = 0; j < count; j++)
     {
         int w = Weight(j, count);
-        uint4 entry = ((64 - w) * start.value + w * end.value + 32) >> 6;
+        uint4 entry = ((64 - w) * startValue + w * endValue + 32) >> 6;
         palette[j] = entry.x | entry.y << 8 | entry.z << 16 | entry.w << 24;
     }
 
@@ -592,32 +576,25 @@ bool Evaluate(Subset s, Mode mode, Endpoint start, Endpoint end, inout SubsetFit
 // One endpoint of the pair the solid table holds for each channel of the target.
 Endpoint SolidEndpointFor(Mode mode, int4 target, int table, int pbit, bool isEnd)
 {
-    Endpoint e = ZeroEndpoint();
-    e.pbit = pbit;
+    int4 bits = 0;
     for (int ch = 0; ch < 4; ch++)
     {
         uint pair = SolidEndpoint(table + target[ch]);
-        e.bits[ch] = isEnd ? pair >> 8 : pair & 0xFF;
+        bits[ch] = isEnd ? pair >> 8 : pair & 0xFF;
     }
-
-    // Alpha has either the colour's bits or none, so every channel can share them.
-    e.value = Expand(e.bits << 1 | pbit, mode.colorBits + 1);
 
     if (mode.alphaBits == 0)
-    {
-        e.bits.w = 0;
-        e.value.w = 255;
-    }
+        bits.w = 0;
 
-    return e;
+    return MakeEndpoint(bits, pbit);
 }
 
-// Tries a pair of endpoints under every p-bit combination the mode allows. With solid set, a
-// and b are ignored, and the pairs come from the solid tables to put the mode's solid palette
-// entry on the colour instead. Quantizing the endpoints to the colour itself only reaches the
-// values an endpoint can hold, while an interpolated entry can land on nearly every value
-// exactly.
-bool Try(Subset s, Mode mode, float4 a, float4 b, bool solid, float4 color, inout SubsetFit fit)
+// Tries a pair of endpoints under every p-bit combination the mode allows, or only combination
+// combo if it isn't -1. With solid set, a and b are ignored, and the pairs come from the solid
+// tables to put the mode's solid palette entry on the colour instead. Quantizing the endpoints
+// to the colour itself only reaches the values an endpoint can hold, while an interpolated
+// entry can land on nearly every value exactly.
+bool Try(Subset s, Mode mode, int combo, float4 a, float4 b, bool solid, float4 color, inout SubsetFit fit)
 {
     if (solid && mode.solidTable < 0)
         return false;
@@ -625,9 +602,10 @@ bool Try(Subset s, Mode mode, float4 a, float4 b, bool solid, float4 color, inou
     int4 target = (int4)round(clamp(color, 0, 255));
 
     bool improved = false;
-    int combinations = mode.sharedPBit ? 2 : 4;
+    int first = combo < 0 ? 0 : combo;
+    int last = combo < 0 ? (mode.sharedPBit ? 2 : 4) : combo + 1;
     [loop]
-    for (int p = 0; p < combinations; p++)
+    for (int p = first; p < last; p++)
     {
         int startPBit = mode.sharedPBit ? p : p & 1;
         int endPBit = mode.sharedPBit ? p : p >> 1;
@@ -653,7 +631,7 @@ bool Try(Subset s, Mode mode, float4 a, float4 b, bool solid, float4 color, inou
 }
 
 // Solves for the endpoints that best reproduce the targets given these indices.
-bool TryLeastSquares(Subset s, Mode mode, uint2 selected, inout SubsetFit fit)
+bool TryLeastSquares(Subset s, Mode mode, int combo, uint2 selected, inout SubsetFit fit)
 {
     uint count = 1u << mode.indexBits;
 
@@ -689,7 +667,7 @@ bool TryLeastSquares(Subset s, Mode mode, uint2 selected, inout SubsetFit fit)
         return false;
 
     float inv = 1.0 / det;
-    return Try(s, mode, (c * d0 - b * d1) * inv, (a * d1 - b * d0) * inv, false, 0, fit);
+    return Try(s, mode, combo, (c * d0 - b * d1) * inv, (a * d1 - b * d0) * inv, false, 0, fit);
 }
 
 // Variants 0-2 pull the lowest indices up, then the highest down, then both. The rest remap
@@ -738,6 +716,7 @@ uint2 PerturbIndices(uint2 selected, uint pixels, int maxIndex, int lo, int hi, 
 float FitSubset(
     uint pixels,
     Mode mode,
+    int combo,
     bool fast,
     out Endpoint start,
     out Endpoint end,
@@ -765,7 +744,7 @@ float FitSubset(
         maxT = max(maxT, t);
     }
 
-    Try(s, mode, mean + axis * minT, mean + axis * maxT, false, 0, fit);
+    Try(s, mode, combo, mean + axis * minT, mean + axis * maxT, false, 0, fit);
 
     if (maxT > minT)
     {
@@ -804,13 +783,13 @@ float FitSubset(
             }
 
             // The refinement passes stop as soon as one fails to improve the fit.
-            if (!TryLeastSquares(s, mode, selected, fit) && step < REFINE_ITERATIONS)
+            if (!TryLeastSquares(s, mode, combo, selected, fit) && step < REFINE_ITERATIONS)
                 step = REFINE_ITERATIONS - 1;
         }
     }
 
     if (fit.error > 0)
-        Try(s, mode, 0, 0, true, mean, fit);
+        Try(s, mode, combo, 0, 0, true, mean, fit);
 
     start = fit.start;
     end = fit.end;
@@ -818,23 +797,23 @@ float FitSubset(
     return fit.error;
 }
 
-Candidate EmptyCandidate(Mode mode, uint shape)
+Candidate EmptyCandidate(int number, uint shape)
 {
     Candidate candidate;
-    candidate.mode = mode;
+    candidate.number = number;
     candidate.shape = shape;
     candidate.error = 0;
-    candidate.start0 = ZeroEndpoint();
-    candidate.end0 = ZeroEndpoint();
-    candidate.start1 = ZeroEndpoint();
-    candidate.end1 = ZeroEndpoint();
+    candidate.start0 = 0;
+    candidate.end0 = 0;
+    candidate.start1 = 0;
+    candidate.end1 = 0;
     candidate.indices = 0;
     return candidate;
 }
 
-Candidate EncodeShape(Mode mode, uint shape, bool fast)
+Candidate EncodeShape(Mode mode, int combo, uint shape, bool fast)
 {
-    Candidate candidate = EmptyCandidate(mode, shape);
+    Candidate candidate = EmptyCandidate(mode.number, shape);
 
     uint mask = mode.subsets == 2 ? PartitionMasks[shape] : 0;
 
@@ -846,6 +825,7 @@ Candidate EncodeShape(Mode mode, uint shape, bool fast)
         candidate.error += FitSubset(
             subset == 0 ? ~mask & 0xFFFF : mask,
             mode,
+            combo,
             fast,
             start,
             end,
@@ -901,9 +881,14 @@ void Write(inout BitWriter writer, uint value, uint bits)
     writer.pos += bits;
 }
 
+uint EndpointChannel(Endpoint e, int ch)
+{
+    return (e >> (ch * 7)) & 0x7F;
+}
+
 uint4 Pack(Candidate c)
 {
-    Mode mode = c.mode;
+    Mode mode = GetMode(c.number);
     uint count = 1u << mode.indexBits;
     uint mask = mode.subsets == 2 ? PartitionMasks[c.shape] : 0;
     int anchor1 = mode.subsets == 2 ? (int)PartitionAnchors[c.shape] : -1;
@@ -939,28 +924,28 @@ uint4 Pack(Candidate c)
     {
         int bits = ch < 3 ? mode.colorBits : mode.alphaBits;
 
-        Write(writer, c.start0.bits[ch], bits);
-        Write(writer, c.end0.bits[ch], bits);
+        Write(writer, EndpointChannel(c.start0, ch), bits);
+        Write(writer, EndpointChannel(c.end0, ch), bits);
         if (mode.subsets == 2)
         {
-            Write(writer, c.start1.bits[ch], bits);
-            Write(writer, c.end1.bits[ch], bits);
+            Write(writer, EndpointChannel(c.start1, ch), bits);
+            Write(writer, EndpointChannel(c.end1, ch), bits);
         }
     }
 
     if (mode.sharedPBit)
     {
-        Write(writer, c.start0.pbit, 1);
-        Write(writer, c.start1.pbit, 1);
+        Write(writer, EndpointPBit(c.start0), 1);
+        Write(writer, EndpointPBit(c.start1), 1);
     }
     else
     {
-        Write(writer, c.start0.pbit, 1);
-        Write(writer, c.end0.pbit, 1);
+        Write(writer, EndpointPBit(c.start0), 1);
+        Write(writer, EndpointPBit(c.end0), 1);
         if (mode.subsets == 2)
         {
-            Write(writer, c.start1.pbit, 1);
-            Write(writer, c.end1.pbit, 1);
+            Write(writer, EndpointPBit(c.start1), 1);
+            Write(writer, EndpointPBit(c.end1), 1);
         }
     }
 
@@ -971,73 +956,6 @@ uint4 Pack(Candidate c)
     }
 
     return writer.words;
-}
-
-// Mode 6 first, which is all the fast setting tries. Otherwise modes 1, 3 and 7 follow on the
-// partitions that rank best, with 7 skipped for opaque blocks since 1 and 3 cover those.
-uint4 Encode(bool fast)
-{
-    bool opaque = true;
-    bool solid = true;
-    for (uint i = 0; i < 16; i++)
-    {
-        opaque = opaque && g_Block[i] >> 24 == 255;
-        solid = solid && g_Block[i] == g_Block[0];
-    }
-
-    Candidate best = EmptyCandidate(GetMode(6), 0);
-    best.error = INFINITY;
-
-    uint shapes[SHAPE_CANDIDATES];
-    for (int j = 0; j < SHAPE_CANDIDATES; j++)
-        shapes[j] = 0;
-
-    // bc7e's fastest approach sends solid blocks straight to the fit that puts a palette entry
-    // on their colour.
-    if (fast && solid)
-    {
-        Mode mode = GetMode(6);
-        Subset s = MakeSubset(0xFFFF);
-        SubsetFit fit = EmptyFit();
-        Try(s, mode, 0, 0, true, Pixel(0), fit);
-
-        best.error = fit.error;
-        best.start0 = fit.start;
-        best.end0 = fit.end;
-        best.indices = fit.indices;
-        return Pack(best);
-    }
-
-    int steps = fast ? 1 : 1 + SHAPE_CANDIDATES * 3;
-
-    [loop]
-    for (int step = 0; step < steps; step++)
-    {
-        int number = 6;
-        uint shape = 0;
-        if (step > 0)
-        {
-            if (step == 1)
-            {
-                if (best.error <= 0)
-                    break;
-                RankShapes(shapes);
-            }
-
-            uint m = (uint)(step - 1) % 3;
-            if (m == 2 && opaque)
-                continue;
-
-            number = m == 0 ? 1 : m == 1 ? 3 : 7;
-            shape = shapes[(uint)(step - 1) / 3];
-        }
-
-        Candidate candidate = EncodeShape(GetMode(number), shape, fast);
-        if (candidate.error < best.error)
-            best = candidate;
-    }
-
-    return Pack(best);
 }
 
 // Small mip levels can end partway through a block, so the edge pixels fill the rest.
@@ -1051,28 +969,155 @@ void LoadBlock(uint2 block)
     }
 }
 
-void EncodeBlock(uint2 block, bool fast)
+// The fast setting follows bc7e's fastest preset: mode 6 only, with solid blocks sent straight
+// to the fit that puts a palette entry on their colour.
+uint4 EncodeFast()
 {
-    block.y += _BlockRowOffset;
+    bool solid = true;
+    for (uint i = 0; i < 16; i++)
+        solid = solid && g_Block[i] == g_Block[0];
+
+    Mode mode = GetMode(6);
+    Candidate best = EmptyCandidate(6, 0);
+    if (solid)
+    {
+        Subset s = MakeSubset(0xFFFF);
+        SubsetFit fit = EmptyFit();
+        Try(s, mode, -1, 0, 0, true, Pixel(0), fit);
+
+        best.error = fit.error;
+        best.start0 = fit.start;
+        best.end0 = fit.end;
+        best.indices = fit.indices;
+    }
+    else
+    {
+        best.error = FitSubset(0xFFFF, mode, -1, true, best.start0, best.end0, best.indices);
+    }
+
+    return Pack(best);
+}
+
+// Each thread encodes the block at its xy, offset by _BlockRowOffset rows, so the dispatch
+// covers ceil(blocks / 8) groups on each axis.
+[numthreads(8, 8, 1)]
+void EncodeBC7Fast(uint3 id : SV_DispatchThreadID)
+{
+    uint2 block = uint2(id.x, id.y + _BlockRowOffset);
 
     uint blocksX = (_ResX + 3) / 4;
     if (block.x >= blocksX || block.y >= _BlockRowEnd)
         return;
 
     LoadBlock(block);
-    _Blocks[_BlockOffset + (block.y - _BlockRowOffset) * blocksX + block.x] = Encode(fast);
+    _Blocks[_BlockOffset + id.y * blocksX + block.x] = EncodeFast();
 }
 
-// Each thread encodes the block at its xy, offset by _BlockRowOffset rows, so the dispatch
-// covers ceil(blocks / 8) groups on each axis.
-[numthreads(8, 8, 1)]
-void EncodeBC7(uint3 id : SV_DispatchThreadID)
+// The full setting spreads each block over LANES threads, one per candidate shape, so that a
+// thread's work is short enough for the SMs to keep plenty of them in flight.
+#define LANES SHAPE_CANDIDATES
+#define BLOCKS_PER_GROUP (64 / LANES)
+
+groupshared float gs_Scores[BLOCKS_PER_GROUP * PARTITION_COUNT];
+groupshared float gs_Errors[64];
+groupshared uint4 gs_Encoded[64];
+
+// The partition the block's scores rank n-th, with ties going to the lower index.
+uint NthShape(uint scores, uint n)
 {
-    EncodeBlock(id.xy, false);
+    [loop]
+    for (uint p = 0; p < PARTITION_COUNT; p++)
+    {
+        float score = gs_Scores[scores + p];
+        uint rank = 0;
+        [loop]
+        for (uint q = 0; q < PARTITION_COUNT; q++)
+        {
+            float other = gs_Scores[scores + q];
+            rank += other < score || (other == score && q < p) ? 1 : 0;
+        }
+
+        if (rank == n)
+            return p;
+    }
+
+    return 0;
 }
 
-[numthreads(8, 8, 1)]
-void EncodeBC7Fast(uint3 id : SV_DispatchThreadID)
+// Every lane tries modes 1, 3 and 7 on the shape of its rank, with 7 skipped for opaque blocks
+// since 1 and 3 cover those. The first four lanes also try mode 6, each with one of its p-bit
+// combinations, which takes about as long as one of the others. Each candidate is packed as
+// soon as it wins, so only its encoding stays live through the fits after it.
+void EncodeLane(uint scores, uint lane, out float error, out uint4 encoded)
 {
-    EncodeBlock(id.xy, true);
+    bool opaque = true;
+    for (uint i = 0; i < 16; i++)
+        opaque = opaque && g_Block[i] >> 24 == 255;
+
+    uint shape = NthShape(scores, lane);
+
+    error = INFINITY;
+    encoded = 0;
+
+    uint items = lane < 4 ? 4 : 3;
+    [loop]
+    for (uint item = 0; item < items; item++)
+    {
+        if (item == 2 && opaque)
+            continue;
+
+        bool six = item == 3;
+        int number = six ? 6 : item == 0 ? 1 : item == 1 ? 3 : 7;
+        Candidate candidate = EncodeShape(GetMode(number), six ? (int)lane : -1, six ? 0 : shape, false);
+        if (candidate.error < error)
+        {
+            error = candidate.error;
+            encoded = Pack(candidate);
+        }
+    }
+}
+
+// Each group covers BLOCKS_PER_GROUP consecutive blocks of the dispatch, row-major from
+// _BlockRowOffset, so the dispatch covers ceil(blocks / BLOCKS_PER_GROUP) groups along x. Every
+// thread has to reach the barriers, so the ones past the last block run through them too.
+[numthreads(64, 1, 1)]
+void EncodeBC7(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
+{
+    uint slot = thread / LANES;
+    uint lane = thread % LANES;
+    uint scores = slot * PARTITION_COUNT;
+
+    uint blocksX = (_ResX + 3) / 4;
+    uint index = group.x * BLOCKS_PER_GROUP + slot;
+    uint2 block = uint2(index % blocksX, index / blocksX + _BlockRowOffset);
+    bool valid = block.y < _BlockRowEnd;
+
+    LoadBlock(uint2(block.x, min(block.y, _BlockRowEnd - 1)));
+
+    for (uint shape = lane; shape < PARTITION_COUNT; shape += LANES)
+        gs_Scores[scores + shape] = ShapeScore(shape);
+
+    GroupMemoryBarrierWithGroupSync();
+
+    float error = INFINITY;
+    uint4 encoded = 0;
+    if (valid)
+        EncodeLane(scores, lane, error, encoded);
+
+    gs_Errors[thread] = error;
+    gs_Encoded[thread] = encoded;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (!valid || lane != 0)
+        return;
+
+    uint winner = thread;
+    for (uint other = thread + 1; other < thread + LANES; other++)
+    {
+        if (gs_Errors[other] < gs_Errors[winner])
+            winner = other;
+    }
+
+    _Blocks[_BlockOffset + index] = gs_Encoded[winner];
 }

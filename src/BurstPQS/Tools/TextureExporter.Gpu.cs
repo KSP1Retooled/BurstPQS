@@ -31,11 +31,14 @@ internal static partial class TextureExporter
     /// </remarks>
     static class GpuBC7
     {
-        // Each thread runs for about as long as a whole dispatch takes, so a dispatch has to be
-        // this big to give the SMs enough warps to hide latency with. Consecutive dispatches run
-        // one after the other rather than filling the SMs together.
+        // Consecutive dispatches run one after the other rather than filling the SMs together,
+        // so each one has to bring enough warps to hide latency with on its own.
         const int BlocksPerDispatch = 65536;
         const int BlocksPerFrame = BlocksPerDispatch;
+
+        // The full kernel spreads each block over 8 threads of a 64-thread group, so a group
+        // covers this many consecutive blocks. Matches BLOCKS_PER_GROUP in BC7Encode.compute.
+        const int BlocksPerGroup = 8;
 
         // A block covers at most 16 pixels, so this holds any dispatch's pixel rows.
         const int SlotPixels = BlocksPerDispatch * 16;
@@ -519,7 +522,10 @@ internal static partial class TextureExporter
                 cb.SetComputeIntParam(shader, BlockRowEndId, end);
                 cb.SetComputeIntParam(shader, PixelOffsetId, pixelOffset);
                 cb.SetComputeIntParam(shader, BlockOffsetId, blockOffset);
-                cb.DispatchCompute(shader, kernel, (blocksX + 7) / 8, (rows + 7) / 8, 1);
+                if (fast)
+                    cb.DispatchCompute(shader, kernel, (blocksX + 7) / 8, (rows + 7) / 8, 1);
+                else
+                    cb.DispatchCompute(shader, kernel, (blocks + BlocksPerGroup - 1) / BlocksPerGroup, 1, 1);
 
                 var entry = new InFlight(this, blockOffset * 16, blocks * 16);
                 pending++;

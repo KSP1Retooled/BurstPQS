@@ -11,6 +11,7 @@ public class BC7TestWindow : EditorWindow
 {
     // Matches the exporter, which keeps each dispatch well under the driver's timeout.
     const int BlocksPerDispatch = 65536;
+    const int BlocksPerGroup = 8;
 
     ComputeShader shader;
     string sourcePath = "";
@@ -151,7 +152,10 @@ public class BC7TestWindow : EditorWindow
                 shader.SetInt("_BlockRowEnd", end);
                 shader.SetInt("_PixelOffset", row * 4 * width);
                 shader.SetInt("_BlockOffset", row * blocksX);
-                shader.Dispatch(kernel, (blocksX + 7) / 8, (end - row + 7) / 8, 1);
+                if (fast)
+                    shader.Dispatch(kernel, (blocksX + 7) / 8, (end - row + 7) / 8, 1);
+                else
+                    shader.Dispatch(kernel, ((end - row) * blocksX + BlocksPerGroup - 1) / BlocksPerGroup, 1, 1);
             }
 
             blockBuffer.GetData(words);
