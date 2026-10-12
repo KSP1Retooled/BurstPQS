@@ -115,7 +115,7 @@ internal struct TextureExportOptions
         projection == TextureProjection.Equirectangular ? resolution / 2 : resolution;
 }
 
-internal static class TextureExporter
+internal static partial class TextureExporter
 {
     const int BlockSize = 128;
 
@@ -150,6 +150,9 @@ internal static class TextureExporter
 
         var exportDir = ExportDirectory(body);
         Directory.CreateDirectory(exportDir);
+
+        if (options.exportColor && options.colorFormat is ColorFormat.BC7 or ColorFormat.BC7Fast)
+            yield return GpuBC7.Load();
 
         using var heightMaps = new HeightMapSet(
             exportDir,
@@ -731,6 +734,8 @@ internal static class TextureExporter
         NativeArray<Color32> oceanColors;
         NativeArray<float> oceanBlockMinMax;
 
+        readonly List<GpuBC7.EncodeTask> gpuTasks = [];
+
         float minH;
         float maxH;
         float oceanMinH;
@@ -1125,25 +1130,57 @@ internal static class TextureExporter
                     _ => (BlockEncoding?)null,
                 };
 
-                var colorHandle = SaveColors(
-                    ref colors,
-                    colorEncoding,
-                    exportDir,
-                    $"{body.name}_Color{suffix}",
-                    handle
-                );
-                handles.Enqueue(colorHandle);
-
-                if (hasOcean)
+                if (
+                    colorEncoding is BlockEncoding.BC7 or BlockEncoding.BC7Fast
+                    && GpuBC7.IsAvailable(resX)
+                )
                 {
-                    var oceanColorHandle = SaveColors(
-                        ref oceanColors,
+                    bool fast = colorEncoding == BlockEncoding.BC7Fast;
+                    gpuTasks.Add(
+                        SaveColorsGpu(
+                            ref colors,
+                            fast,
+                            exportDir,
+                            $"{body.name}_Color{suffix}",
+                            handle
+                        )
+                    );
+
+                    if (hasOcean)
+                    {
+                        gpuTasks.Add(
+                            SaveColorsGpu(
+                                ref oceanColors,
+                                fast,
+                                exportDir,
+                                $"{body.name}_Color_Ocean{suffix}",
+                                handle
+                            )
+                        );
+                    }
+                }
+                else
+                {
+                    var colorHandle = SaveColors(
+                        ref colors,
                         colorEncoding,
                         exportDir,
-                        $"{body.name}_Color_Ocean{suffix}",
+                        $"{body.name}_Color{suffix}",
                         handle
                     );
-                    handles.Enqueue(oceanColorHandle);
+                    handles.Enqueue(colorHandle);
+
+                    if (hasOcean)
+                    {
+                        var oceanColorHandle = SaveColors(
+                            ref oceanColors,
+                            colorEncoding,
+                            exportDir,
+                            $"{body.name}_Color_Ocean{suffix}",
+                            handle
+                        );
+                        handles.Enqueue(oceanColorHandle);
+                    }
                 }
             }
             else
@@ -1173,6 +1210,14 @@ internal static class TextureExporter
                     yield return new WaitUntil(() => handle.IsCompleted);
 
                 handle.Complete();
+            }
+
+            foreach (var task in gpuTasks)
+            {
+                yield return task;
+
+                if (task.Error is not null)
+                    throw new Exception($"Failed to encode {bodyName} on the GPU", task.Error);
             }
         }
 
@@ -1481,20 +1526,57 @@ internal static class TextureExporter
                 level = next;
             }
 
-            return ScheduleSaveDdsJob(
-                ref compressed,
-                format,
-                resX,
-                resY,
-                mipCount,
-                path,
-                handle
-            );
+            return ScheduleSaveDdsJob(ref compressed, format, resX, resY, mipCount, path, handle);
+        }
+
+        /// <summary>
+        /// Writes <paramref name="source"/> as a BC7 DDS encoded on the GPU. The mip levels are
+        /// still downsampled on the CPU. Takes ownership of <paramref name="source"/>.
+        /// </summary>
+        GpuBC7.EncodeTask SaveColorsGpu(
+            ref NativeArray<Color32> source,
+            bool fast,
+            string exportDir,
+            string baseName,
+            JobHandle dependsOn
+        )
+        {
+            int resX = options.Width;
+            int resY = options.Height;
+
+            var path = Path.Combine(exportDir, baseName + ".dds");
+            Debug.Log($"[BurstPQS] Writing {path}");
+
+            var levels = new NativeArray<Color32>[MipCount(resX, resY)];
+            levels[0] = source;
+            source = default;
+            var handle = dependsOn;
+
+            for (int mip = 1; mip < levels.Length; mip++)
+            {
+                int w = MipSize(resX, mip);
+                int h = MipSize(resY, mip);
+                levels[mip] = AllocatePixels<Color32>(w * h);
+                handle = new TextureExportDownsampleColor32Job
+                {
+                    source = levels[mip - 1],
+                    output = levels[mip],
+                    srcX = MipSize(resX, mip - 1),
+                    srcY = MipSize(resY, mip - 1),
+                    dstX = w,
+                    dstY = h,
+                }.ScheduleBatch(h, 16, handle);
+            }
+
+            return GpuBC7.Encode(levels, resX, resY, fast, path, handle);
         }
 
         public void Dispose()
         {
             permit?.Dispose();
+
+            foreach (var task in gpuTasks)
+                task.Dispose();
 
             blockMinMax.Dispose();
             oceanBlockMinMax.Dispose();
@@ -1685,6 +1767,31 @@ internal static class TextureExporter
 
         public void Execute()
         {
+            using var stream = new FileStream(
+                path.Target,
+                FileMode.Create,
+                FileAccess.Write,
+                FileShare.None,
+                1 << 16
+            );
+
+            WriteHeader(stream, format, resX, resY, mipCount);
+
+            using var source = new UnmanagedMemoryStream(
+                (byte*)data.GetUnsafeReadOnlyPtr(),
+                data.Length
+            );
+            source.CopyTo(stream, 1 << 20);
+        }
+
+        public static void WriteHeader(
+            Stream stream,
+            DdsFormat format,
+            int resX,
+            int resY,
+            int mipCount
+        )
+        {
             bool compressed = format is not (DdsFormat.R8 or DdsFormat.R16);
             uint pitchOrLinearSize = format switch
             {
@@ -1693,14 +1800,7 @@ internal static class TextureExporter
                 _ => (uint)MipLevelBytes(format, resX, resY),
             };
 
-            using var stream = new FileStream(
-                path.Target,
-                FileMode.Create,
-                FileAccess.Write,
-                FileShare.None,
-                1 << 16
-            );
-            using var writer = new BinaryWriter(stream);
+            using var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, true);
 
             writer.Write(DdsMagic);
 
@@ -1766,14 +1866,6 @@ internal static class TextureExporter
                 writer.Write(1u); // arraySize
                 writer.Write(0u); // miscFlags2
             }
-
-            writer.Flush();
-
-            using var source = new UnmanagedMemoryStream(
-                (byte*)data.GetUnsafeReadOnlyPtr(),
-                data.Length
-            );
-            source.CopyTo(stream, 1 << 20);
         }
 
         static void WriteLuminanceFormat(BinaryWriter writer, uint bits, uint mask)

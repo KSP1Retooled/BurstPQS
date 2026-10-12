@@ -1,0 +1,1078 @@
+// BC7 encoder covering modes 1, 3, 6 and 7. A port of BurstPQS.Util.Textures.BC7, one thread
+// per 4x4 block.
+//
+// EncodeBC7Fast follows bc7e's fastest preset, which only tries mode 6.
+
+#pragma kernel EncodeBC7
+#pragma kernel EncodeBC7Fast
+
+// Each dispatch covers a run of whole block rows, and has a slot of its own in each buffer, so
+// that several can be in flight at once.
+
+// Color32 pixels with red in the low byte. The dispatch's pixel rows, starting at pixel row
+// _BlockRowOffset * 4, are stored row-major from element _PixelOffset.
+StructuredBuffer<uint> _Pixels;
+
+// One block per element with the low 64 bits in xy. The dispatch's blocks are stored row-major
+// from element _BlockOffset.
+RWStructuredBuffer<uint4> _Blocks;
+
+// The size of the whole level.
+uint _ResX;
+uint _ResY;
+
+// The first block row this dispatch covers, counted from the top of the level.
+uint _BlockRowOffset;
+
+// One past the last block row this dispatch covers. Its groups can run past it, onto rows the
+// slot doesn't hold.
+uint _BlockRowEnd;
+
+uint _PixelOffset;
+uint _BlockOffset;
+
+#define SHAPE_CANDIDATES 8
+#define PARTITION_COUNT 64
+#define REFINE_ITERATIONS 2
+#define SPREAD_STEPS 1
+#define INFINITY asfloat(0x7F800000)
+
+// The interpolation weights for each palette size, starting at the palette size so that
+// count + index finds them.
+static const uint Weights[32] =
+{
+    0, 0, 0, 0, 0, 21, 43, 64, 0, 9, 18, 27, 37, 46, 55, 64,
+    0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64
+};
+
+// The partitions for the two-subset modes, as given by the D3D11 BC7 specification. Bit i is
+// set when pixel i belongs to the second subset.
+static const uint PartitionMasks[PARTITION_COUNT] =
+{
+    0xCCCC, 0x8888, 0xEEEE, 0xECC8, 0xC880, 0xFEEC, 0xFEC8, 0xEC80,
+    0xC800, 0xFFEC, 0xFE80, 0xE800, 0xFFE8, 0xFF00, 0xFFF0, 0xF000,
+    0xF710, 0x008E, 0x7100, 0x08CE, 0x008C, 0x7310, 0x3100, 0x8CCE,
+    0x088C, 0x3110, 0x6666, 0x366C, 0x17E8, 0x0FF0, 0x718E, 0x399C,
+    0xAAAA, 0xF0F0, 0x5A5A, 0x33CC, 0x3C3C, 0x55AA, 0x9696, 0xA55A,
+    0x73CE, 0x13C8, 0x324C, 0x3BDC, 0x6996, 0xC33C, 0x9966, 0x0660,
+    0x0272, 0x04E4, 0x4E40, 0x2720, 0xC936, 0x936C, 0x39C6, 0x639C,
+    0x9336, 0x9CC6, 0x817E, 0xE718, 0xCCF0, 0x0FCC, 0x7744, 0xEE22
+};
+
+// The second subset's anchor pixel, whose index is stored without its top bit. The first
+// subset's anchor is always pixel 0.
+static const uint PartitionAnchors[PARTITION_COUNT] =
+{
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 2, 8, 2, 2, 8, 8, 15, 2, 8, 2, 2, 8, 8, 2, 2,
+    15, 15, 6, 8, 2, 8, 15, 15, 2, 8, 2, 2, 2, 15, 15, 6,
+    6, 2, 6, 8, 15, 15, 2, 2, 15, 15, 15, 15, 15, 2, 2, 15
+};
+
+// For each mode with a solid palette entry, each of its p-bit combinations and each 8-bit
+// value, the endpoint bits that put the entry closest to the value: start in the low byte and
+// end in the high. Two entries per element, the even one in the low half. Generated from
+// BC7.SolidEndpoints, laid out as mode 1 (p-bits 00, 11), mode 6 (00, 10, 01, 11) and mode 7
+// (00, 10, 01, 11).
+static const uint SolidEndpoints[1280] =
+{
+    0x01000000, 0x03000200, 0x04000101, 0x06000500, 0x08000700, 0x0A000900, 0x09010B00, 0x0D000C00,
+    0x0F000E00, 0x0E011000, 0x10010F01, 0x0F021101, 0x11021002, 0x10031202, 0x12031103, 0x11041303,
+    0x13041204, 0x12051404, 0x14051305, 0x13061505, 0x15061406, 0x14071606, 0x16071507, 0x15081707,
+    0x17081608, 0x16091808, 0x18091709, 0x170A1909, 0x190A180A, 0x180B1A0A, 0x1A0B190B, 0x190C1B0B,
+    0x1B0C1A0C, 0x1A0D1C0C, 0x1C0D1B0D, 0x1B0E1D0D, 0x1D0E1C0E, 0x1C0F1E0E, 0x1E0F1D0F, 0x1D101F0F,
+    0x1F101E10, 0x1E112010, 0x20111F11, 0x1F122111, 0x21122012, 0x20132212, 0x22132113, 0x21142313,
+    0x23142214, 0x22152414, 0x24152315, 0x23162515, 0x25162416, 0x24172616, 0x26172517, 0x25182717,
+    0x27182618, 0x26192818, 0x28192719, 0x271A2919, 0x291A281A, 0x281B2A1A, 0x2A1B291B, 0x291C2B1B,
+    0x2B1C2A1C, 0x2A1D2C1C, 0x2C1D2B1D, 0x2B1E2D1D, 0x2D1E2C1E, 0x2C1F2E1E, 0x2E1F2D1F, 0x2C202F1F,
+    0x2E202D20, 0x2D212F20, 0x2F212E21, 0x2E223021, 0x30222F22, 0x2F233122, 0x31233023, 0x30243223,
+    0x32243124, 0x31253324, 0x33253225, 0x32263425, 0x34263326, 0x33273526, 0x35273427, 0x34283627,
+    0x36283528, 0x35293728, 0x37293629, 0x362A3829, 0x382A372A, 0x372B392A, 0x392B382B, 0x382C3A2B,
+    0x3A2C392C, 0x392D3B2C, 0x3B2D3A2D, 0x3A2E3C2D, 0x3C2E3B2E, 0x3B2F3D2E, 0x3D2F3C2F, 0x3C303E2F,
+    0x3E303D30, 0x3D313F30, 0x3F313E31, 0x3E323B33, 0x3E333F32, 0x3F333C34, 0x3F343E34, 0x3E353D35,
+    0x3D363F35, 0x3F363E36, 0x3E373D37, 0x3D383F37, 0x3F383E38, 0x3E393D39, 0x3B3B3F39, 0x3F3A3E3A,
+    0x3C3C3E3B, 0x3E3C3F3B, 0x3D3D3F3C, 0x3F3D3E3D, 0x3E3E3D3E, 0x3D3F3F3E, 0x3F3F3E3F, 0x3F3F3F3F,
+    0x00000000, 0x01000000, 0x03000200, 0x04000101, 0x06000500, 0x08000700, 0x0A000900, 0x09010B00,
+    0x0D000C00, 0x0F000E00, 0x0E011000, 0x10010F01, 0x0F021101, 0x11021002, 0x10031202, 0x12031103,
+    0x11041303, 0x13041204, 0x12051404, 0x14051305, 0x13061505, 0x15061406, 0x14071606, 0x16071507,
+    0x15081707, 0x17081608, 0x16091808, 0x18091709, 0x170A1909, 0x190A180A, 0x180B1A0A, 0x1A0B190B,
+    0x190C1B0B, 0x1B0C1A0C, 0x1A0D1C0C, 0x1C0D1B0D, 0x1B0E1D0D, 0x1D0E1C0E, 0x1C0F1E0E, 0x1E0F1D0F,
+    0x1D101F0F, 0x1F101E10, 0x1E112010, 0x20111F11, 0x1F122111, 0x21122012, 0x20132212, 0x22132113,
+    0x21142313, 0x23142214, 0x22152414, 0x24152315, 0x23162515, 0x25162416, 0x24172616, 0x26172517,
+    0x25182717, 0x27182618, 0x26192818, 0x28192719, 0x271A2919, 0x291A281A, 0x281B2A1A, 0x2A1B291B,
+    0x291C2B1B, 0x2B1C2A1C, 0x2A1D2C1C, 0x2C1D2B1D, 0x2B1E2D1D, 0x2D1E2C1E, 0x2C1F2E1E, 0x2E1F2D1F,
+    0x2C202F1F, 0x2E202D20, 0x2D212F20, 0x2F212E21, 0x2E223021, 0x30222F22, 0x2F233122, 0x31233023,
+    0x30243223, 0x32243124, 0x31253324, 0x33253225, 0x32263425, 0x34263326, 0x33273526, 0x35273427,
+    0x34283627, 0x36283528, 0x35293728, 0x37293629, 0x362A3829, 0x382A372A, 0x372B392A, 0x392B382B,
+    0x382C3A2B, 0x3A2C392C, 0x392D3B2C, 0x3B2D3A2D, 0x3A2E3C2D, 0x3C2E3B2E, 0x3B2F3D2E, 0x3D2F3C2F,
+    0x3C303E2F, 0x3E303D30, 0x3D313F30, 0x3F313E31, 0x3E323B33, 0x3E333F32, 0x3F333C34, 0x3F343E34,
+    0x3E353D35, 0x3D363F35, 0x3F363E36, 0x3E373D37, 0x3D383F37, 0x3F383E38, 0x3E393D39, 0x3B3B3F39,
+    0x3F3A3E3A, 0x3C3C3E3B, 0x3E3C3F3B, 0x3D3D3F3C, 0x3F3D3E3D, 0x3E3E3D3E, 0x3D3F3F3E, 0x3F3F3E3F,
+    0x01000000, 0x04000300, 0x07000600, 0x0A000900, 0x0D000C00, 0x0C020D01, 0x0F020E02, 0x0E040F03,
+    0x11041004, 0x10061105, 0x13061206, 0x12081307, 0x15081408, 0x140A1509, 0x170A160A, 0x160C170B,
+    0x190C180C, 0x180E190D, 0x1B0E1A0E, 0x1A101B0F, 0x1D101C10, 0x1C121D11, 0x1F121E12, 0x1E141F13,
+    0x21142014, 0x20162115, 0x23162216, 0x22182317, 0x25182418, 0x241A2519, 0x271A261A, 0x261C271B,
+    0x291C281C, 0x281E291D, 0x2B1E2A1E, 0x2A202B1F, 0x2D202C20, 0x2C222D21, 0x2F222E22, 0x2E242F23,
+    0x31243024, 0x30263125, 0x33263226, 0x32283327, 0x35283428, 0x342A3529, 0x372A362A, 0x362C372B,
+    0x392C382C, 0x382E392D, 0x3B2E3A2E, 0x3A303B2F, 0x3D303C30, 0x3C323D31, 0x3F323E32, 0x3E343F33,
+    0x41344034, 0x40364135, 0x43364236, 0x42384337, 0x45384438, 0x443A4539, 0x473A463A, 0x463C473B,
+    0x493C483C, 0x483E493D, 0x4B3E4A3E, 0x4A404B3F, 0x4D404C40, 0x4C424D41, 0x4F424E42, 0x4E444F43,
+    0x51445044, 0x50465145, 0x53465246, 0x52485347, 0x55485448, 0x544A5549, 0x574A564A, 0x564C574B,
+    0x594C584C, 0x584E594D, 0x5B4E5A4E, 0x5A505B4F, 0x5D505C50, 0x5C525D51, 0x5F525E52, 0x5E545F53,
+    0x61546054, 0x60566155, 0x63566256, 0x62586357, 0x65586458, 0x645A6559, 0x675A665A, 0x665C675B,
+    0x695C685C, 0x685E695D, 0x6B5E6A5E, 0x6A606B5F, 0x6D606C60, 0x6C626D61, 0x6F626E62, 0x6E646F63,
+    0x71647064, 0x70667165, 0x73667266, 0x72687367, 0x75687468, 0x746A7569, 0x776A766A, 0x766C776B,
+    0x796C786C, 0x786E796D, 0x7B6E7A6E, 0x7A707B6F, 0x7D707C70, 0x7C727D71, 0x7F727E72, 0x7E747F73,
+    0x7F757E75, 0x7E777F76, 0x7F787E78, 0x7E7A7F79, 0x7F7B7E7B, 0x7E7D7F7C, 0x7F7E7E7E, 0x7F7F7F7F,
+    0x00000000, 0x03000200, 0x06000500, 0x09000800, 0x0C000B00, 0x0D010E00, 0x0E020D02, 0x0F031002,
+    0x10040F04, 0x11051204, 0x12061106, 0x13071406, 0x14081308, 0x15091608, 0x160A150A, 0x170B180A,
+    0x180C170C, 0x190D1A0C, 0x1A0E190E, 0x1B0F1C0E, 0x1C101B10, 0x1D111E10, 0x1E121D12, 0x1F132012,
+    0x20141F14, 0x21152214, 0x22162116, 0x23172416, 0x24182318, 0x25192618, 0x261A251A, 0x271B281A,
+    0x281C271C, 0x291D2A1C, 0x2A1E291E, 0x2B1F2C1E, 0x2C202B20, 0x2D212E20, 0x2E222D22, 0x2F233022,
+    0x30242F24, 0x31253224, 0x32263126, 0x33273426, 0x34283328, 0x35293628, 0x362A352A, 0x372B382A,
+    0x382C372C, 0x392D3A2C, 0x3A2E392E, 0x3B2F3C2E, 0x3C303B30, 0x3D313E30, 0x3E323D32, 0x3F334032,
+    0x40343F34, 0x41354234, 0x42364136, 0x43374436, 0x44384338, 0x45394638, 0x463A453A, 0x473B483A,
+    0x483C473C, 0x493D4A3C, 0x4A3E493E, 0x4B3F4C3E, 0x4C404B40, 0x4D414E40, 0x4E424D42, 0x4F435042,
+    0x50444F44, 0x51455244, 0x52465146, 0x53475446, 0x54485348, 0x55495648, 0x564A554A, 0x574B584A,
+    0x584C574C, 0x594D5A4C, 0x5A4E594E, 0x5B4F5C4E, 0x5C505B50, 0x5D515E50, 0x5E525D52, 0x5F536052,
+    0x60545F54, 0x61556254, 0x62566156, 0x63576456, 0x64586358, 0x65596658, 0x665A655A, 0x675B685A,
+    0x685C675C, 0x695D6A5C, 0x6A5E695E, 0x6B5F6C5E, 0x6C606B60, 0x6D616E60, 0x6E626D62, 0x6F637062,
+    0x70646F64, 0x71657264, 0x72667166, 0x73677466, 0x74687368, 0x75697668, 0x766A756A, 0x776B786A,
+    0x786C776C, 0x796D7A6C, 0x7A6E796E, 0x7B6F7C6E, 0x7C707B70, 0x7D717E70, 0x7E727D72, 0x7F737E73,
+    0x7E757F74, 0x7F767E76, 0x7E787F77, 0x7F797E79, 0x7E7B7F7A, 0x7F7C7E7C, 0x7E7E7F7D, 0x7F7F7E7F,
+    0x01000000, 0x04000200, 0x07000500, 0x0A000800, 0x0D000B00, 0x0C020C01, 0x0F020D02, 0x0E040E03,
+    0x11040F04, 0x10061005, 0x13061106, 0x12081207, 0x15081308, 0x140A1409, 0x170A150A, 0x160C160B,
+    0x190C170C, 0x180E180D, 0x1B0E190E, 0x1A101A0F, 0x1D101B10, 0x1C121C11, 0x1F121D12, 0x1E141E13,
+    0x21141F14, 0x20162015, 0x23162116, 0x22182217, 0x25182318, 0x241A2419, 0x271A251A, 0x261C261B,
+    0x291C271C, 0x281E281D, 0x2B1E291E, 0x2A202A1F, 0x2D202B20, 0x2C222C21, 0x2F222D22, 0x2E242E23,
+    0x31242F24, 0x30263025, 0x33263126, 0x32283227, 0x35283328, 0x342A3429, 0x372A352A, 0x362C362B,
+    0x392C372C, 0x382E382D, 0x3B2E392E, 0x3A303A2F, 0x3D303B30, 0x3C323C31, 0x3F323D32, 0x3E343E33,
+    0x41343F34, 0x40364035, 0x43364136, 0x42384237, 0x45384338, 0x443A4439, 0x473A453A, 0x463C463B,
+    0x493C473C, 0x483E483D, 0x4B3E493E, 0x4A404A3F, 0x4D404B40, 0x4C424C41, 0x4F424D42, 0x4E444E43,
+    0x51444F44, 0x50465045, 0x53465146, 0x52485247, 0x55485348, 0x544A5449, 0x574A554A, 0x564C564B,
+    0x594C574C, 0x584E584D, 0x5B4E594E, 0x5A505A4F, 0x5D505B50, 0x5C525C51, 0x5F525D52, 0x5E545E53,
+    0x61545F54, 0x60566055, 0x63566156, 0x62586257, 0x65586358, 0x645A6459, 0x675A655A, 0x665C665B,
+    0x695C675C, 0x685E685D, 0x6B5E695E, 0x6A606A5F, 0x6D606B60, 0x6C626C61, 0x6F626D62, 0x6E646E63,
+    0x71646F64, 0x70667065, 0x73667166, 0x72687267, 0x75687368, 0x746A7469, 0x776A756A, 0x766C766B,
+    0x796C776C, 0x786E786D, 0x7B6E796E, 0x7A707A6F, 0x7D707B70, 0x7C727C71, 0x7F727D72, 0x7E747E73,
+    0x7F757F74, 0x7E777E76, 0x7F787F77, 0x7E7A7E79, 0x7F7B7F7A, 0x7E7D7E7C, 0x7F7E7F7D, 0x7E7F7E7F,
+    0x00000000, 0x03000100, 0x06000400, 0x09000700, 0x0C000A00, 0x0D010D00, 0x0E020C02, 0x0F030F02,
+    0x10040E04, 0x11051104, 0x12061006, 0x13071306, 0x14081208, 0x15091508, 0x160A140A, 0x170B170A,
+    0x180C160C, 0x190D190C, 0x1A0E180E, 0x1B0F1B0E, 0x1C101A10, 0x1D111D10, 0x1E121C12, 0x1F131F12,
+    0x20141E14, 0x21152114, 0x22162016, 0x23172316, 0x24182218, 0x25192518, 0x261A241A, 0x271B271A,
+    0x281C261C, 0x291D291C, 0x2A1E281E, 0x2B1F2B1E, 0x2C202A20, 0x2D212D20, 0x2E222C22, 0x2F232F22,
+    0x30242E24, 0x31253124, 0x32263026, 0x33273326, 0x34283228, 0x35293528, 0x362A342A, 0x372B372A,
+    0x382C362C, 0x392D392C, 0x3A2E382E, 0x3B2F3B2E, 0x3C303A30, 0x3D313D30, 0x3E323C32, 0x3F333F32,
+    0x40343E34, 0x41354134, 0x42364036, 0x43374336, 0x44384238, 0x45394538, 0x463A443A, 0x473B473A,
+    0x483C463C, 0x493D493C, 0x4A3E483E, 0x4B3F4B3E, 0x4C404A40, 0x4D414D40, 0x4E424C42, 0x4F434F42,
+    0x50444E44, 0x51455144, 0x52465046, 0x53475346, 0x54485248, 0x55495548, 0x564A544A, 0x574B574A,
+    0x584C564C, 0x594D594C, 0x5A4E584E, 0x5B4F5B4E, 0x5C505A50, 0x5D515D50, 0x5E525C52, 0x5F535F52,
+    0x60545E54, 0x61556154, 0x62566056, 0x63576356, 0x64586258, 0x65596558, 0x665A645A, 0x675B675A,
+    0x685C665C, 0x695D695C, 0x6A5E685E, 0x6B5F6B5E, 0x6C606A60, 0x6D616D60, 0x6E626C62, 0x6F636F62,
+    0x70646E64, 0x71657164, 0x72667066, 0x73677366, 0x74687268, 0x75697568, 0x766A746A, 0x776B776A,
+    0x786C766C, 0x796D796C, 0x7A6E786E, 0x7B6F7B6E, 0x7C707A70, 0x7D717D70, 0x7E727C72, 0x7F737F72,
+    0x7E757E74, 0x7F767F75, 0x7E787E77, 0x7F797F78, 0x7E7B7E7A, 0x7F7C7F7B, 0x7E7E7E7D, 0x7F7F7F7E,
+    0x00000000, 0x01000100, 0x02000100, 0x03000200, 0x03000300, 0x04000400, 0x05000400, 0x06000500,
+    0x06000600, 0x05010700, 0x08000800, 0x09000004, 0x09000900, 0x0A000A00, 0x0B000A00, 0x0C000105,
+    0x0C000C00, 0x0B010D00, 0x0C010E00, 0x0D010206, 0x0D010D01, 0x0C020E01, 0x0D020008, 0x0E020307,
+    0x02080E02, 0x0D030F02, 0x0E030308, 0x0F030806, 0x05080F03, 0x10031003, 0x0F040409, 0x10040907,
+    0x08081004, 0x11041104, 0x0E060908, 0x000D1005, 0x0B081105, 0x12051205, 0x0F070C08, 0x010E1106,
+    0x0E081206, 0x13061306, 0x14060D09, 0x080C1207, 0x11081307, 0x14071407, 0x15071208, 0x090D1308,
+    0x14081408, 0x15080410, 0x16081309, 0x0A0E1409, 0x15091509, 0x16090710, 0x0810140A, 0x0B0F150A,
+    0x160A160A, 0x170A0A10, 0x0B10150B, 0x100E160B, 0x170B170B, 0x180B0D10, 0x0C11180B, 0x110F170C,
+    0x180C180C, 0x190C1010, 0x1110190C, 0x180D160E, 0x190D0815, 0x1A0D1310, 0x14101A0D, 0x190E170F,
+    0x1A0E0916, 0x1B0E1610, 0x15111B0E, 0x1A0F1A0F, 0x1B0F1014, 0x1C0F1910, 0x1A101C0F, 0x1B100A18,
+    0x1C101115, 0x0C181C10, 0x1B111D10, 0x1C110B19, 0x1D111216, 0x0F181D11, 0x1C121E11, 0x1D121018,
+    0x1E121317, 0x12181E12, 0x1D131F12, 0x1E131318, 0x1F131816, 0x15181F13, 0x1E141E14, 0x1F141419,
+    0x1E151917, 0x18181E15, 0x1F151F15, 0x1E161918, 0x101D1A18, 0x1B181F16, 0x1E171E17, 0x1F171C18,
+    0x111E1D18, 0x1E181E18, 0x1F181E18, 0x1D191D19, 0x181C1E19, 0x1F191F19, 0x1E1A1F19, 0x1E1A1E1A,
+    0x191D1F1A, 0x1E1B1E1B, 0x1F1B1E1B, 0x1F1B1F1B, 0x1A1E1E1C, 0x1F1C1F1C, 0x1E1D1F1C, 0x1E1D1E1D,
+    0x1B1F1F1D, 0x1E1E1E1E, 0x1F1E1E1E, 0x1F1E1F1E, 0x1E1F1E1F, 0x1F1F1F1F, 0x1F1F1F1F, 0x1F1F1F1F,
+    0x00000000, 0x00000000, 0x01000000, 0x02000100, 0x02000200, 0x03000300, 0x04000300, 0x05000400,
+    0x05000500, 0x04010600, 0x07000700, 0x08000700, 0x08000800, 0x09000701, 0x0A000900, 0x0B000005,
+    0x0B000B00, 0x0C000C00, 0x0D000C00, 0x0E000106, 0x0C010E00, 0x0D010D01, 0x0E010D01, 0x0F010804,
+    0x01080F01, 0x0E020E02, 0x0F020208, 0x10020905, 0x04081002, 0x0F030F03, 0x10030309, 0x11030A06,
+    0x07081103, 0x10041004, 0x11040808, 0x12040B07, 0x0A081204, 0x11051105, 0x12050B08, 0x13051006,
+    0x0D081305, 0x12061206, 0x13060C09, 0x14061107, 0x10081406, 0x13071307, 0x14071108, 0x080D1208,
+    0x13081507, 0x14080310, 0x04101408, 0x090E1508, 0x16081608, 0x15090610, 0x05111509, 0x100C1609,
+    0x17091709, 0x160A0910, 0x0A10160A, 0x110D170A, 0x180A180A, 0x170B0C10, 0x0B11170B, 0x120E180B,
+    0x190B190B, 0x180C0F10, 0x1010180C, 0x130F190C, 0x1A0C1A0C, 0x190D1210, 0x1310190D, 0x180E1A0D,
+    0x1B0D1B0D, 0x1A0E1510, 0x14111A0E, 0x190F1B0E, 0x1C0E1C0E, 0x1B0F1810, 0x19101B0F, 0x1A101C0F,
+    0x1D0F1015, 0x0B181B10, 0x1C101C10, 0x1D100C18, 0x1E101116, 0x0E181E10, 0x1D111D11, 0x1E110D19,
+    0x1F111814, 0x11181F11, 0x1E121E12, 0x1F121218, 0x1E131915, 0x14181E13, 0x1F131F13, 0x1E141319,
+    0x1F141A16, 0x17181F14, 0x1E151E15, 0x1F151818, 0x1E161B17, 0x1A181E16, 0x1F161F16, 0x1E171B18,
+    0x1F171C18, 0x1D181F17, 0x1E181D18, 0x1F181C19, 0x1F181F18, 0x1E191E19, 0x1F191E19, 0x1D1A1D1A,
+    0x181D1E1A, 0x1F1A1F1A, 0x1E1B1F1A, 0x1E1B1E1B, 0x191E1F1B, 0x1E1C1E1C, 0x1F1C1E1C, 0x1F1C1F1C,
+    0x1A1F1E1D, 0x1F1D1F1D, 0x1E1E1F1D, 0x1E1E1E1E, 0x1F1E1F1E, 0x1E1F1E1F, 0x1F1F1E1F, 0x1F1F1F1F,
+    0x00000000, 0x01000000, 0x01000100, 0x02000200, 0x03000200, 0x04000300, 0x04000400, 0x03010500,
+    0x06000600, 0x07000600, 0x07000700, 0x08000601, 0x09000800, 0x0A000900, 0x0A000A00, 0x0B000702,
+    0x0C000B00, 0x0D000006, 0x0B010D00, 0x0C010C01, 0x0D010C01, 0x0E010107, 0x00080E01, 0x0D020D02,
+    0x0E020108, 0x0F020805, 0x03080F02, 0x0E030E03, 0x0F030209, 0x10030906, 0x06081003, 0x0F040F04,
+    0x1004030A, 0x11040A07, 0x09081104, 0x10051005, 0x11050A08, 0x12050B08, 0x0C081205, 0x11061106,
+    0x12060B09, 0x13061007, 0x0F081306, 0x12071207, 0x13071008, 0x14071108, 0x12081407, 0x0F0A0210,
+    0x03101308, 0x080E1408, 0x15081508, 0x14090510, 0x04111409, 0x090F1509, 0x16091609, 0x150A0810,
+    0x0910150A, 0x100D160A, 0x170A170A, 0x160B0B10, 0x0A11160B, 0x110E170B, 0x180B180B, 0x170C0E10,
+    0x0B12170C, 0x120F180C, 0x190C190C, 0x180D1110, 0x1210180D, 0x1310190D, 0x1A0D1A0D, 0x190E1410,
+    0x1311190E, 0x180F1A0E, 0x1B0E1B0E, 0x1A0F1710, 0x18101A0F, 0x19101B0F, 0x1C0F1C0F, 0x0A181A10,
+    0x1B101712, 0x1C100B18, 0x1D101016, 0x0D181B11, 0x1C111C11, 0x1D110C19, 0x1E111117, 0x10181E11,
+    0x1D121D12, 0x1E121118, 0x1F121815, 0x13181F12, 0x1E131E13, 0x1F131219, 0x1E141916, 0x16181E14,
+    0x1F141F14, 0x1E15131A, 0x1F151A17, 0x19181F15, 0x1E161E16, 0x1F161A18, 0x1E171B18, 0x1C181E17,
+    0x1F171F17, 0x1E181B19, 0x1E181E18, 0x1F181F18, 0x1E191F18, 0x1F191C1A, 0x1F191F19, 0x1E1A1E1A,
+    0x1F1A1E1A, 0x1D1B1D1B, 0x181E1E1B, 0x1F1B1F1B, 0x1E1C1F1B, 0x1E1C1E1C, 0x191F1F1C, 0x1E1D1E1D,
+    0x1F1D1E1D, 0x1F1D1F1D, 0x1E1E1E1E, 0x1F1E1F1E, 0x1E1F1F1E, 0x1E1F1E1F, 0x1F1F1F1F, 0x1F1F1F1F,
+    0x00000000, 0x00000000, 0x00000000, 0x01000100, 0x02000100, 0x03000200, 0x03000300, 0x04000400,
+    0x05000400, 0x06000500, 0x06000600, 0x05010700, 0x08000800, 0x09000004, 0x09000900, 0x0A000A00,
+    0x0B000A00, 0x0C000105, 0x0C000C00, 0x0B010D00, 0x0C010E00, 0x0D010206, 0x0D010D01, 0x0C020E01,
+    0x0D020008, 0x0E020307, 0x02080E02, 0x0D030F02, 0x0E030308, 0x0F030806, 0x05080F03, 0x10031003,
+    0x0F040409, 0x10040907, 0x08081004, 0x11041104, 0x0E060908, 0x000D1005, 0x0B081105, 0x12051205,
+    0x0F070C08, 0x010E1106, 0x0E081206, 0x13061306, 0x14060D09, 0x080C1207, 0x11081307, 0x14071407,
+    0x15071208, 0x090D1308, 0x14081408, 0x15080410, 0x16081309, 0x0A0E1409, 0x15091509, 0x16090710,
+    0x0810140A, 0x0B0F150A, 0x160A160A, 0x170A0A10, 0x0B10150B, 0x100E160B, 0x170B170B, 0x180B0D10,
+    0x0C11180B, 0x110F170C, 0x180C180C, 0x190C1010, 0x1110190C, 0x180D160E, 0x190D0815, 0x1A0D1310,
+    0x14101A0D, 0x190E170F, 0x1A0E0916, 0x1B0E1610, 0x15111B0E, 0x1A0F1A0F, 0x1B0F1014, 0x1C0F1910,
+    0x1A101C0F, 0x1B100A18, 0x1C101115, 0x0C181C10, 0x1B111D10, 0x1C111E10, 0x1D111216, 0x0F181D11,
+    0x1C121E11, 0x1D121018, 0x1E121317, 0x12181E12, 0x1D131F12, 0x1E131318, 0x1F131816, 0x15181F13,
+    0x1E141E14, 0x1F141419, 0x1E151917, 0x18181E15, 0x1F151F15, 0x1E161918, 0x101D1A18, 0x1B181F16,
+    0x1E171E17, 0x1F171C18, 0x111E1D18, 0x1E181E18, 0x1F181E18, 0x1D191D19, 0x181C1E19, 0x1F191F19,
+    0x1E1A1F19, 0x1E1A1E1A, 0x191D1F1A, 0x1E1B1E1B, 0x1F1B1E1B, 0x1F1B1F1B, 0x1A1E1E1C, 0x1F1C1F1C,
+    0x1E1D1F1C, 0x1E1D1E1D, 0x1B1F1F1D, 0x1E1E1E1E, 0x1F1E1E1E, 0x1F1E1F1E, 0x1E1F1E1F, 0x1F1F1F1F
+};
+
+// fxc inlines every call, so each function below is called from as few places as possible and
+// the modes are runtime values. Otherwise every mode, subset and refinement step gets its own
+// copy of the palette search, and the kernel takes minutes to compile.
+
+struct Mode
+{
+    int number;
+    int subsets;
+    int colorBits;
+
+    // 0 for the modes without alpha, which decode it as 255.
+    int alphaBits;
+    int indexBits;
+    bool sharedPBit;
+
+    // Where the mode's tables start in SolidEndpoints, or -1 where quantizing the endpoints to
+    // the colour itself is already exact.
+    int solidTable;
+};
+
+Mode MakeMode(int number, int subsets, int colorBits, int alphaBits, int indexBits, bool sharedPBit, int solidTable)
+{
+    Mode mode;
+    mode.number = number;
+    mode.subsets = subsets;
+    mode.colorBits = colorBits;
+    mode.alphaBits = alphaBits;
+    mode.indexBits = indexBits;
+    mode.sharedPBit = sharedPBit;
+    mode.solidTable = solidTable;
+    return mode;
+}
+
+Mode GetMode(int number)
+{
+    Mode mode = MakeMode(7, 2, 5, 5, 2, false, 6 * 256);
+    if (number == 1)
+        mode = MakeMode(1, 2, 6, 0, 3, true, 0);
+    else if (number == 3)
+        mode = MakeMode(3, 2, 7, 0, 2, false, -1);
+    else if (number == 6)
+        mode = MakeMode(6, 1, 7, 7, 4, false, 2 * 256);
+    return mode;
+}
+
+struct Endpoint
+{
+    int4 bits;
+    int pbit;
+    int4 value;
+};
+
+// Indices hold 4 bits per pixel, whatever the mode's index size: pixels 0-7 in x, 8-15 in y.
+struct Candidate
+{
+    Mode mode;
+    uint shape;
+    float error;
+
+    Endpoint start0;
+    Endpoint end0;
+    Endpoint start1;
+    Endpoint end1;
+
+    uint2 indices;
+};
+
+// A mask picking the subset's pixels out of the block. fxc can't index an array in a struct
+// when writing, so the pixels stay where they are rather than being packed together.
+struct Subset
+{
+    uint pixels;
+    uint count;
+    float4 sum;
+};
+
+struct SubsetFit
+{
+    Endpoint start;
+    Endpoint end;
+    uint2 indices;
+    float error;
+};
+
+Endpoint ZeroEndpoint()
+{
+    Endpoint e;
+    e.bits = 0;
+    e.pbit = 0;
+    e.value = 0;
+    return e;
+}
+
+SubsetFit EmptyFit()
+{
+    SubsetFit fit;
+    fit.start = ZeroEndpoint();
+    fit.end = ZeroEndpoint();
+    fit.indices = 0;
+    fit.error = INFINITY;
+    return fit;
+}
+
+uint GetIndex(uint2 indices, uint pixel)
+{
+    uint word = pixel < 8 ? indices.x : indices.y;
+    return (word >> ((pixel & 7) * 4)) & 15;
+}
+
+uint2 IndexBits(uint index, uint pixel)
+{
+    uint shifted = index << ((pixel & 7) * 4);
+    return pixel < 8 ? uint2(shifted, 0) : uint2(0, shifted);
+}
+
+int Weight(uint index, uint count)
+{
+    return Weights[count + index];
+}
+
+uint SolidEndpoint(int i)
+{
+    return (SolidEndpoints[i >> 1] >> ((i & 1) * 16)) & 0xFFFF;
+}
+
+int4 Expand(int4 value, int bits)
+{
+    return value << (8 - bits) | value >> (2 * bits - 8);
+}
+
+// The block being encoded, as Color32. A static global is per thread in HLSL, so this is the
+// one copy of the block that everything reads, rather than a copy per array parameter.
+static uint g_Block[16];
+
+float4 Unpack(uint c)
+{
+    return float4(c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF, c >> 24);
+}
+
+float4 Pixel(uint i)
+{
+    return Unpack(g_Block[i]);
+}
+
+// Modes without alpha always decode it as 255, so their fits only aim for that.
+float4 Target(uint i, bool opaqueAlpha)
+{
+    float4 p = Pixel(i);
+    return opaqueAlpha ? float4(p.xyz, 255) : p;
+}
+
+void Moments(uint pixels, bool opaqueAlpha, out float4 mean, out float4x4 cov)
+{
+    mean = 0;
+    uint count = 0;
+    for (uint i = 0; i < 16; i++)
+    {
+        if ((pixels & (1u << i)) == 0)
+            continue;
+
+        mean += Target(i, opaqueAlpha);
+        count++;
+    }
+    mean /= count;
+
+    cov = 0;
+    for (uint j = 0; j < 16; j++)
+    {
+        if ((pixels & (1u << j)) == 0)
+            continue;
+
+        float4 d = Target(j, opaqueAlpha) - mean;
+        cov[0] += d * d.x;
+        cov[1] += d * d.y;
+        cov[2] += d * d.z;
+        cov[3] += d * d.w;
+    }
+}
+
+// Power iteration. A block with no spread falls back to the grey axis, which still puts both
+// endpoints on the block's one colour.
+float4 PrincipalAxis(float4x4 cov)
+{
+    float4 axis = 1;
+    for (int i = 0; i < 8; i++)
+    {
+        axis = mul(cov, axis);
+        float len = length(axis);
+        if (len < 1e-6)
+            return 0.5;
+        axis /= len;
+    }
+    return axis;
+}
+
+// Picks the partitions whose subsets lie closest to a line each, measured as the variance
+// left over once the principal axis is taken out.
+void RankShapes(out uint shapes[SHAPE_CANDIDATES])
+{
+    float scores[SHAPE_CANDIDATES];
+    for (int i = 0; i < SHAPE_CANDIDATES; i++)
+    {
+        scores[i] = INFINITY;
+        shapes[i] = 0;
+    }
+
+    [loop]
+    for (uint shape = 0; shape < PARTITION_COUNT; shape++)
+    {
+        uint mask = PartitionMasks[shape];
+
+        float score = 0;
+        [loop]
+        for (uint half = 0; half < 2; half++)
+        {
+            float4 mean;
+            float4x4 cov;
+            Moments(half == 0 ? ~mask & 0xFFFF : mask, false, mean, cov);
+
+            float4 axis = PrincipalAxis(cov);
+            float trace = cov[0].x + cov[1].y + cov[2].z + cov[3].w;
+            score += trace - dot(axis, mul(cov, axis));
+        }
+
+        // Insertion into the sorted candidate list.
+        int slot = SHAPE_CANDIDATES;
+        while (slot > 0 && score < scores[slot - 1])
+        {
+            if (slot < SHAPE_CANDIDATES)
+            {
+                scores[slot] = scores[slot - 1];
+                shapes[slot] = shapes[slot - 1];
+            }
+            slot--;
+        }
+
+        if (slot < SHAPE_CANDIDATES)
+        {
+            scores[slot] = score;
+            shapes[slot] = shape;
+        }
+    }
+}
+
+Subset MakeSubset(uint pixels)
+{
+    Subset s;
+    s.pixels = pixels;
+    s.count = 0;
+    s.sum = 0;
+    for (uint i = 0; i < 16; i++)
+    {
+        if ((pixels & (1u << i)) == 0)
+            continue;
+
+        s.sum += Pixel(i);
+        s.count++;
+    }
+
+    return s;
+}
+
+// Each channel is stored as its top bits plus the p-bit as the lowest, and the decoder
+// replicates the high bits of that into whatever is left of 8.
+Endpoint Quantize(float4 e, Mode mode, int pbit)
+{
+    e = clamp(e, 0, 255);
+
+    // Alpha has either the colour's bits or none, so every channel can share them.
+    int bits = mode.colorBits;
+    int maxValue = (1 << bits) - 1;
+    int4 guess = clamp((int4)round((e * ((2 << bits) - 1) / 255.0 - pbit) * 0.5), 0, maxValue);
+
+    Endpoint endpoint = ZeroEndpoint();
+    endpoint.pbit = pbit;
+    float4 bestErr = INFINITY;
+    for (int k = -1; k <= 1; k++)
+    {
+        // Clamping repeats an edge candidate, which can't win a second time.
+        int4 c = clamp(guess + k, 0, maxValue);
+        int4 value = Expand(c << 1 | pbit, bits + 1);
+        float4 d = value - e;
+        bool4 better = d * d < bestErr;
+
+        bestErr = better ? d * d : bestErr;
+        endpoint.bits = better ? c : endpoint.bits;
+        endpoint.value = better ? value : endpoint.value;
+    }
+
+    if (mode.alphaBits == 0)
+    {
+        endpoint.bits.w = 0;
+        endpoint.value.w = 255;
+    }
+
+    return endpoint;
+}
+
+// Picks the nearest palette entry for each pixel in the subset. Every distance is a whole
+// number well under 2^24, so the float sums are exact.
+bool Evaluate(Subset s, Mode mode, Endpoint start, Endpoint end, inout SubsetFit fit)
+{
+    uint count = 1u << mode.indexBits;
+
+    // Packed like the pixels, to keep the array small.
+    uint palette[16];
+    [loop]
+    for (uint j = 0; j < count; j++)
+    {
+        int w = Weight(j, count);
+        uint4 entry = ((64 - w) * start.value + w * end.value + 32) >> 6;
+        palette[j] = entry.x | entry.y << 8 | entry.z << 16 | entry.w << 24;
+    }
+
+    float error = 0;
+    uint2 indices = 0;
+    [loop]
+    for (uint k = 0; k < 16; k++)
+    {
+        if ((s.pixels & (1u << k)) == 0)
+            continue;
+
+        float4 px = Pixel(k);
+        float best = INFINITY;
+        uint selected = 0;
+        [loop]
+        for (uint e = 0; e < count; e++)
+        {
+            float4 d = px - Unpack(palette[e]);
+            float dist = mad(d.x, d.x, mad(d.y, d.y, mad(d.z, d.z, d.w * d.w)));
+            if (dist < best)
+            {
+                best = dist;
+                selected = e;
+            }
+        }
+
+        error += best;
+        indices |= IndexBits(selected, k);
+    }
+
+    if (error >= fit.error)
+        return false;
+
+    fit.start = start;
+    fit.end = end;
+    fit.indices = indices;
+    fit.error = error;
+    return true;
+}
+
+// One endpoint of the pair the solid table holds for each channel of the target.
+Endpoint SolidEndpointFor(Mode mode, int4 target, int table, int pbit, bool isEnd)
+{
+    Endpoint e = ZeroEndpoint();
+    e.pbit = pbit;
+    for (int ch = 0; ch < 4; ch++)
+    {
+        uint pair = SolidEndpoint(table + target[ch]);
+        e.bits[ch] = isEnd ? pair >> 8 : pair & 0xFF;
+    }
+
+    // Alpha has either the colour's bits or none, so every channel can share them.
+    e.value = Expand(e.bits << 1 | pbit, mode.colorBits + 1);
+
+    if (mode.alphaBits == 0)
+    {
+        e.bits.w = 0;
+        e.value.w = 255;
+    }
+
+    return e;
+}
+
+// Tries a pair of endpoints under every p-bit combination the mode allows. With solid set, a
+// and b are ignored, and the pairs come from the solid tables to put the mode's solid palette
+// entry on the colour instead. Quantizing the endpoints to the colour itself only reaches the
+// values an endpoint can hold, while an interpolated entry can land on nearly every value
+// exactly.
+bool Try(Subset s, Mode mode, float4 a, float4 b, bool solid, float4 color, inout SubsetFit fit)
+{
+    if (solid && mode.solidTable < 0)
+        return false;
+
+    int4 target = (int4)round(clamp(color, 0, 255));
+
+    bool improved = false;
+    int combinations = mode.sharedPBit ? 2 : 4;
+    [loop]
+    for (int p = 0; p < combinations; p++)
+    {
+        int startPBit = mode.sharedPBit ? p : p & 1;
+        int endPBit = mode.sharedPBit ? p : p >> 1;
+
+        Endpoint start;
+        Endpoint end;
+        if (solid)
+        {
+            int table = mode.solidTable + p * 256;
+            start = SolidEndpointFor(mode, target, table, startPBit, false);
+            end = SolidEndpointFor(mode, target, table, endPBit, true);
+        }
+        else
+        {
+            start = Quantize(a, mode, startPBit);
+            end = Quantize(b, mode, endPBit);
+        }
+
+        improved = Evaluate(s, mode, start, end, fit) || improved;
+    }
+
+    return improved;
+}
+
+// Solves for the endpoints that best reproduce the targets given these indices.
+bool TryLeastSquares(Subset s, Mode mode, uint2 selected, inout SubsetFit fit)
+{
+    uint count = 1u << mode.indexBits;
+
+    float sumW = 0;
+    float c = 0;
+    float4 d1 = 0;
+    for (uint k = 0; k < 16; k++)
+    {
+        if ((s.pixels & (1u << k)) == 0)
+            continue;
+
+        float w = Weight(GetIndex(selected, k), count) / 64.0;
+        sumW += w;
+        c += w * w;
+        d1 += w * Pixel(k);
+    }
+
+    float b = sumW - c;
+    float a = s.count - sumW - b;
+    float4 total = s.sum;
+
+    // Modes without alpha always decode it as 255, so the fit only aims for that.
+    if (mode.alphaBits == 0)
+    {
+        d1.w = 255.0 * sumW;
+        total.w = 255.0 * s.count;
+    }
+
+    float4 d0 = total - d1;
+
+    float det = a * c - b * b;
+    if (abs(det) < 1e-6)
+        return false;
+
+    float inv = 1.0 / det;
+    return Try(s, mode, (c * d0 - b * d1) * inv, (a * d1 - b * d0) * inv, false, 0, fit);
+}
+
+// Variants 0-2 pull the lowest indices up, then the highest down, then both. The rest remap
+// the indices as though the endpoints sat a step or so outside or inside where they are now.
+#define PERTURBED_VARIANTS 11
+
+uint2 PerturbIndices(uint2 selected, uint pixels, int maxIndex, int lo, int hi, int variant)
+{
+    // The remaps cover low in [-1, 1] and high in [max - 1, max + 1], skipping the identity.
+    uint grid = max(variant - 3, 0);
+    grid += grid >= 4 ? 1 : 0;
+    int low = (int)(grid / 3) - SPREAD_STEPS;
+    int high = maxIndex - 1 + (int)(grid % 3);
+
+    uint2 result = 0;
+    for (uint i = 0; i < 16; i++)
+    {
+        if ((pixels & (1u << i)) == 0)
+            continue;
+
+        int index = GetIndex(selected, i);
+        if (variant < 3)
+        {
+            if (variant != 1 && index == lo && index < maxIndex)
+                index++;
+            else if (variant != 0 && index == hi && index > 0)
+                index--;
+        }
+        else
+        {
+            float remapped = floor(maxIndex * (float)(index - low) / (high - low) + 0.5);
+            index = clamp((int)remapped, 0, maxIndex);
+        }
+
+        result |= IndexBits(index, i);
+    }
+
+    return result;
+}
+
+// Fits one subset's endpoints along its principal axis, then refines them with least-squares
+// passes over the chosen indices. Writes the subset's pixels into indices.
+//
+// The refinements after that follow bc7e: least-squares solves for the indices with their
+// extremes pulled in or spread out, and fitting the subset's average as a single colour.
+float FitSubset(
+    uint pixels,
+    Mode mode,
+    bool fast,
+    out Endpoint start,
+    out Endpoint end,
+    inout uint2 indices
+)
+{
+    bool opaqueAlpha = mode.alphaBits == 0;
+    SubsetFit fit = EmptyFit();
+    Subset s = MakeSubset(pixels);
+
+    float4 mean;
+    float4x4 cov;
+    Moments(pixels, opaqueAlpha, mean, cov);
+    float4 axis = PrincipalAxis(cov);
+
+    float minT = INFINITY;
+    float maxT = -INFINITY;
+    for (uint j = 0; j < 16; j++)
+    {
+        if ((pixels & (1u << j)) == 0)
+            continue;
+
+        float t = dot(Target(j, opaqueAlpha) - mean, axis);
+        minT = min(minT, t);
+        maxT = max(maxT, t);
+    }
+
+    Try(s, mode, mean + axis * minT, mean + axis * maxT, false, 0, fit);
+
+    if (maxT > minT)
+    {
+        int maxIndex = (1 << mode.indexBits) - 1;
+        int steps = REFINE_ITERATIONS + (fast ? 0 : PERTURBED_VARIANTS);
+
+        uint2 base = 0;
+        int lo = 0;
+        int hi = 0;
+
+        // The refinement passes, then the perturbed variants of the indices they settle on.
+        // Once the error reaches 0 nothing can beat it, so stopping there changes nothing.
+        [loop]
+        for (int step = 0; step < steps && fit.error > 0; step++)
+        {
+            uint2 selected = fit.indices;
+            if (step >= REFINE_ITERATIONS)
+            {
+                if (step == REFINE_ITERATIONS)
+                {
+                    base = fit.indices;
+                    lo = maxIndex;
+                    hi = 0;
+                    for (uint k = 0; k < 16; k++)
+                    {
+                        if ((pixels & (1u << k)) == 0)
+                            continue;
+
+                        int index = GetIndex(base, k);
+                        lo = min(lo, index);
+                        hi = max(hi, index);
+                    }
+                }
+
+                selected = PerturbIndices(base, pixels, maxIndex, lo, hi, step - REFINE_ITERATIONS);
+            }
+
+            // The refinement passes stop as soon as one fails to improve the fit.
+            if (!TryLeastSquares(s, mode, selected, fit) && step < REFINE_ITERATIONS)
+                step = REFINE_ITERATIONS - 1;
+        }
+    }
+
+    if (fit.error > 0)
+        Try(s, mode, 0, 0, true, mean, fit);
+
+    start = fit.start;
+    end = fit.end;
+    indices |= fit.indices;
+    return fit.error;
+}
+
+Candidate EmptyCandidate(Mode mode, uint shape)
+{
+    Candidate candidate;
+    candidate.mode = mode;
+    candidate.shape = shape;
+    candidate.error = 0;
+    candidate.start0 = ZeroEndpoint();
+    candidate.end0 = ZeroEndpoint();
+    candidate.start1 = ZeroEndpoint();
+    candidate.end1 = ZeroEndpoint();
+    candidate.indices = 0;
+    return candidate;
+}
+
+Candidate EncodeShape(Mode mode, uint shape, bool fast)
+{
+    Candidate candidate = EmptyCandidate(mode, shape);
+
+    uint mask = mode.subsets == 2 ? PartitionMasks[shape] : 0;
+
+    [loop]
+    for (int subset = 0; subset < mode.subsets; subset++)
+    {
+        Endpoint start;
+        Endpoint end;
+        candidate.error += FitSubset(
+            subset == 0 ? ~mask & 0xFFFF : mask,
+            mode,
+            fast,
+            start,
+            end,
+            candidate.indices
+        );
+
+        if (subset == 0)
+        {
+            candidate.start0 = start;
+            candidate.end0 = end;
+        }
+        else
+        {
+            candidate.start1 = start;
+            candidate.end1 = end;
+        }
+    }
+
+    return candidate;
+}
+
+uint2 Invert(uint2 indices, uint pixels, uint count)
+{
+    for (uint i = 0; i < 16; i++)
+    {
+        if ((pixels & (1u << i)) == 0)
+            continue;
+
+        uint inverted = count - 1 - GetIndex(indices, i);
+        indices &= ~IndexBits(15, i);
+        indices |= IndexBits(inverted, i);
+    }
+
+    return indices;
+}
+
+struct BitWriter
+{
+    uint4 words;
+    uint pos;
+};
+
+void Write(inout BitWriter writer, uint value, uint bits)
+{
+    uint word = writer.pos >> 5;
+    uint offset = writer.pos & 31;
+    uint4 lane = uint4(0, 1, 2, 3);
+
+    writer.words |= lane == word ? value << offset : 0;
+    if (offset + bits > 32)
+        writer.words |= lane == word + 1 ? value >> (32 - offset) : 0;
+
+    writer.pos += bits;
+}
+
+uint4 Pack(Candidate c)
+{
+    Mode mode = c.mode;
+    uint count = 1u << mode.indexBits;
+    uint mask = mode.subsets == 2 ? PartitionMasks[c.shape] : 0;
+    int anchor1 = mode.subsets == 2 ? (int)PartitionAnchors[c.shape] : -1;
+
+    // Each subset's anchor is stored without its top bit, so it has to be in the lower half.
+    // Swapping a subset's endpoints turns its index i into count - 1 - i.
+    if (GetIndex(c.indices, 0) >= count / 2)
+    {
+        Endpoint swap = c.start0;
+        c.start0 = c.end0;
+        c.end0 = swap;
+        c.indices = Invert(c.indices, ~mask & 0xFFFF, count);
+    }
+
+    if (anchor1 >= 0 && GetIndex(c.indices, anchor1) >= count / 2)
+    {
+        Endpoint swap = c.start1;
+        c.start1 = c.end1;
+        c.end1 = swap;
+        c.indices = Invert(c.indices, mask, count);
+    }
+
+    BitWriter writer;
+    writer.words = 0;
+    writer.pos = 0;
+
+    Write(writer, 1u << mode.number, mode.number + 1);
+    if (mode.subsets == 2)
+        Write(writer, c.shape, 6);
+
+    int channels = mode.alphaBits > 0 ? 4 : 3;
+    for (int ch = 0; ch < channels; ch++)
+    {
+        int bits = ch < 3 ? mode.colorBits : mode.alphaBits;
+
+        Write(writer, c.start0.bits[ch], bits);
+        Write(writer, c.end0.bits[ch], bits);
+        if (mode.subsets == 2)
+        {
+            Write(writer, c.start1.bits[ch], bits);
+            Write(writer, c.end1.bits[ch], bits);
+        }
+    }
+
+    if (mode.sharedPBit)
+    {
+        Write(writer, c.start0.pbit, 1);
+        Write(writer, c.start1.pbit, 1);
+    }
+    else
+    {
+        Write(writer, c.start0.pbit, 1);
+        Write(writer, c.end0.pbit, 1);
+        if (mode.subsets == 2)
+        {
+            Write(writer, c.start1.pbit, 1);
+            Write(writer, c.end1.pbit, 1);
+        }
+    }
+
+    for (int i = 0; i < 16; i++)
+    {
+        int bits = i == 0 || i == anchor1 ? mode.indexBits - 1 : mode.indexBits;
+        Write(writer, GetIndex(c.indices, i), bits);
+    }
+
+    return writer.words;
+}
+
+// Mode 6 first, which is all the fast setting tries. Otherwise modes 1, 3 and 7 follow on the
+// partitions that rank best, with 7 skipped for opaque blocks since 1 and 3 cover those.
+uint4 Encode(bool fast)
+{
+    bool opaque = true;
+    bool solid = true;
+    for (uint i = 0; i < 16; i++)
+    {
+        opaque = opaque && g_Block[i] >> 24 == 255;
+        solid = solid && g_Block[i] == g_Block[0];
+    }
+
+    Candidate best = EmptyCandidate(GetMode(6), 0);
+    best.error = INFINITY;
+
+    uint shapes[SHAPE_CANDIDATES];
+    for (int j = 0; j < SHAPE_CANDIDATES; j++)
+        shapes[j] = 0;
+
+    // bc7e's fastest approach sends solid blocks straight to the fit that puts a palette entry
+    // on their colour.
+    if (fast && solid)
+    {
+        Mode mode = GetMode(6);
+        Subset s = MakeSubset(0xFFFF);
+        SubsetFit fit = EmptyFit();
+        Try(s, mode, 0, 0, true, Pixel(0), fit);
+
+        best.error = fit.error;
+        best.start0 = fit.start;
+        best.end0 = fit.end;
+        best.indices = fit.indices;
+        return Pack(best);
+    }
+
+    int steps = fast ? 1 : 1 + SHAPE_CANDIDATES * 3;
+
+    [loop]
+    for (int step = 0; step < steps; step++)
+    {
+        int number = 6;
+        uint shape = 0;
+        if (step > 0)
+        {
+            if (step == 1)
+            {
+                if (best.error <= 0)
+                    break;
+                RankShapes(shapes);
+            }
+
+            uint m = (uint)(step - 1) % 3;
+            if (m == 2 && opaque)
+                continue;
+
+            number = m == 0 ? 1 : m == 1 ? 3 : 7;
+            shape = shapes[(uint)(step - 1) / 3];
+        }
+
+        Candidate candidate = EncodeShape(GetMode(number), shape, fast);
+        if (candidate.error < best.error)
+            best = candidate;
+    }
+
+    return Pack(best);
+}
+
+// Small mip levels can end partway through a block, so the edge pixels fill the rest.
+void LoadBlock(uint2 block)
+{
+    for (uint y = 0; y < 4; y++)
+    {
+        uint row = _PixelOffset + (min(block.y * 4 + y, _ResY - 1) - _BlockRowOffset * 4) * _ResX;
+        for (uint x = 0; x < 4; x++)
+            g_Block[y * 4 + x] = _Pixels[row + min(block.x * 4 + x, _ResX - 1)];
+    }
+}
+
+void EncodeBlock(uint2 block, bool fast)
+{
+    block.y += _BlockRowOffset;
+
+    uint blocksX = (_ResX + 3) / 4;
+    if (block.x >= blocksX || block.y >= _BlockRowEnd)
+        return;
+
+    LoadBlock(block);
+    _Blocks[_BlockOffset + (block.y - _BlockRowOffset) * blocksX + block.x] = Encode(fast);
+}
+
+// Each thread encodes the block at its xy, offset by _BlockRowOffset rows, so the dispatch
+// covers ceil(blocks / 8) groups on each axis.
+[numthreads(8, 8, 1)]
+void EncodeBC7(uint3 id : SV_DispatchThreadID)
+{
+    EncodeBlock(id.xy, false);
+}
+
+[numthreads(8, 8, 1)]
+void EncodeBC7Fast(uint3 id : SV_DispatchThreadID)
+{
+    EncodeBlock(id.xy, true);
+}
