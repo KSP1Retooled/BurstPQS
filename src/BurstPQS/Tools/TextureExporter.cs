@@ -432,7 +432,10 @@ internal static class TextureExporter
                     yield return new WaitUntil(() => handle.IsCompleted);
 
                 handle.Complete();
-                maps.Dequeue().Dispose();
+
+                var map = maps.Dequeue();
+                map.LogTiming();
+                map.Dispose();
             }
         }
 
@@ -453,6 +456,7 @@ internal static class TextureExporter
             readonly MemoryMappedViewAccessor view;
 
             bool released;
+            EncodeTimer timer;
 
             public NativeArray<float> Heights { get; }
 
@@ -546,6 +550,8 @@ internal static class TextureExporter
                     case HeightFormat.BC4:
                     {
                         int blocks = count / 16;
+                        timer = new EncodeTimer(Path.GetFileName(path), blocks);
+
                         var pixels = AllocatePixels<ulong>(blocks);
                         var encodeHandle = new TextureExportEncodeHeightsBC4Job
                         {
@@ -554,7 +560,7 @@ internal static class TextureExporter
                             minH = minH,
                             maxH = maxH,
                             resX = resX,
-                        }.ScheduleBatch(blocks, 256);
+                        }.ScheduleBatch(blocks, 256, timer.Start(default));
 
                         return ScheduleSaveDdsJob(
                             ref pixels,
@@ -562,7 +568,7 @@ internal static class TextureExporter
                             resX,
                             resY,
                             path,
-                            ScheduleRelease(encodeHandle)
+                            ScheduleRelease(timer.Stop(encodeHandle))
                         );
                     }
 
@@ -636,9 +642,13 @@ internal static class TextureExporter
                 file.Dispose();
             }
 
+            public void LogTiming() => timer?.Log();
+
             public void Dispose()
             {
                 Release();
+                timer?.Dispose();
+                timer = null;
 
                 // A scratch file left behind is not worth failing a finished export over, and
                 // the next export overwrites it anyway.
@@ -692,6 +702,8 @@ internal static class TextureExporter
         float maxH;
         float oceanMinH;
         float oceanMaxH;
+
+        readonly List<EncodeTimer> timers = [];
 
         public PlanetExporter(
             CelestialBody body,
@@ -1130,6 +1142,13 @@ internal static class TextureExporter
 
                 handle.Complete();
             }
+
+            foreach (var timer in timers)
+            {
+                timer.Log();
+                timer.Dispose();
+            }
+            timers.Clear();
         }
 
         private JobHandle ComputeBlock(
@@ -1385,6 +1404,9 @@ internal static class TextureExporter
             Debug.Log($"[BurstPQS] Writing {path}");
 
             int blocks = resX * resY / 16;
+            var timer = new EncodeTimer(Path.GetFileName(path), blocks);
+            timers.Add(timer);
+
             var compressed = AllocatePixels<byte>(blocks * enc.BytesPerBlock());
             var handle = new TextureExportCompressJob
             {
@@ -1392,7 +1414,8 @@ internal static class TextureExporter
                 output = compressed,
                 encoding = enc,
                 resX = resX,
-            }.ScheduleBatch(blocks, 64, dependsOn);
+            }.ScheduleBatch(blocks, 64, timer.Start(dependsOn));
+            handle = timer.Stop(handle);
             handle = source.Dispose(handle);
 
             var format = enc switch
@@ -1409,6 +1432,10 @@ internal static class TextureExporter
         public void Dispose()
         {
             permit?.Dispose();
+
+            foreach (var timer in timers)
+                timer.Dispose();
+            timers.Clear();
 
             blockMinMax.Dispose();
             oceanBlockMinMax.Dispose();
@@ -1663,6 +1690,42 @@ internal static class TextureExporter
             writer.Write(0u); // gBitMask
             writer.Write(0u); // bBitMask
             writer.Write(0u); // aBitMask
+        }
+    }
+    #endregion
+
+    #region Timing
+    /// <summary>
+    /// Measures an encode from when its input is ready to when it finishes. The timestamps come
+    /// from jobs either side of the encode, and the result is logged on the main thread, since
+    /// logging from a worker thread takes KSP's debug console down.
+    /// </summary>
+    sealed class EncodeTimer(string label, int blocks) : IDisposable
+    {
+        NativeArray<long> stamps = new(2, Allocator.Persistent);
+
+        public JobHandle Start(JobHandle dependsOn) =>
+            new StampJob { stamps = stamps, index = 0 }.Schedule(dependsOn);
+
+        public JobHandle Stop(JobHandle encode) =>
+            new StampJob { stamps = stamps, index = 1 }.Schedule(encode);
+
+        public void Log()
+        {
+            double ms = (stamps[1] - stamps[0]) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            Debug.Log(
+                $"[BurstPQS] Encoded {label}: {blocks} blocks in {ms:F1} ms ({ms * 1000.0 / blocks:F2} us/block)"
+            );
+        }
+
+        public void Dispose() => stamps.Dispose();
+
+        struct StampJob : IJob
+        {
+            public NativeArray<long> stamps;
+            public int index;
+
+            public void Execute() => stamps[index] = System.Diagnostics.Stopwatch.GetTimestamp();
         }
     }
     #endregion

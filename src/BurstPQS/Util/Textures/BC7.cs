@@ -24,6 +24,12 @@ internal static unsafe class BC7
         public int alphaBits;
         public int indexBits;
         public bool sharedPBit;
+
+        /// <summary>
+        /// The palette entry a single colour is fitted to, or -1 where quantizing the endpoints
+        /// to the colour itself is already exact.
+        /// </summary>
+        public int solidIndex;
     }
 
     static Mode Mode1 =>
@@ -34,6 +40,7 @@ internal static unsafe class BC7
             colorBits = 6,
             indexBits = 3,
             sharedPBit = true,
+            solidIndex = 2,
         };
 
     static Mode Mode3 =>
@@ -43,6 +50,7 @@ internal static unsafe class BC7
             subsets = 2,
             colorBits = 7,
             indexBits = 2,
+            solidIndex = -1,
         };
 
     static Mode Mode6 =>
@@ -53,6 +61,7 @@ internal static unsafe class BC7
             colorBits = 7,
             alphaBits = 7,
             indexBits = 4,
+            solidIndex = 5,
         };
 
     static Mode Mode7 =>
@@ -63,6 +72,7 @@ internal static unsafe class BC7
             colorBits = 5,
             alphaBits = 5,
             indexBits = 2,
+            solidIndex = 1,
         };
 
     struct Endpoint
@@ -231,8 +241,19 @@ internal static unsafe class BC7
         return candidate;
     }
 
+    struct SubsetFit
+    {
+        public Endpoint start;
+        public Endpoint end;
+        public ulong indices;
+        public float error;
+    }
+
     // Fits one subset's endpoints along its principal axis, then refines them with
     // least-squares passes over the chosen indices. Writes the subset's pixels into indices.
+    //
+    // The refinements after that follow bc7e: least-squares solves for the indices with their
+    // extremes pulled in or spread out, and fitting the subset's average as a single colour.
     static float FitSubset(
         float4* px,
         int pixels,
@@ -246,6 +267,8 @@ internal static unsafe class BC7
         var target = stackalloc float4[16];
         for (int i = 0; i < 16; i++)
             target[i] = mode.alphaBits == 0 ? new float4(px[i].xyz, 255f) : px[i];
+
+        var fit = new SubsetFit { error = float.PositiveInfinity };
 
         Moments(target, pixels, out float4 mean, out float4x4 cov);
         float4 axis = BlockMath.PrincipalAxis(cov);
@@ -262,57 +285,250 @@ internal static unsafe class BC7
             maxT = math.max(maxT, t);
         }
 
-        QuantizePair(mean + axis * minT, mean + axis * maxT, mode, out start, out end);
-        float best = Assign(px, pixels, mode, start, end, out ulong bestIndices);
+        Try(px, pixels, mode, mean + axis * minT, mean + axis * maxT, ref fit);
 
-        int count = 1 << mode.indexBits;
-        for (int iter = 0; iter < BlockMath.RefineIterations && best > 0f; iter++)
+        if (maxT > minT)
         {
-            float a = 0f,
-                b = 0f,
-                c = 0f;
-            float4 d0 = 0f,
-                d1 = 0f;
+            for (int iter = 0; iter < BlockMath.RefineIterations && fit.error > 0f; iter++)
+            {
+                if (!TryLeastSquares(px, target, pixels, mode, fit.indices, ref fit))
+                    break;
+            }
+
+            if (fit.error > 0f)
+                TryPerturbedIndices(px, target, pixels, mode, ref fit);
+        }
+
+        if (fit.error > 0f)
+            TrySolid(px, pixels, mode, mean, ref fit);
+
+        start = fit.start;
+        end = fit.end;
+        indices |= fit.indices;
+        return fit.error;
+    }
+
+    const int SpreadSteps = 1;
+
+    static void TryPerturbedIndices(
+        float4* px,
+        float4* target,
+        int pixels,
+        Mode mode,
+        ref SubsetFit fit
+    )
+    {
+        int max = (1 << mode.indexBits) - 1;
+        ulong selected = fit.indices;
+
+        int lo = max;
+        int hi = 0;
+        for (int i = 0; i < 16; i++)
+        {
+            if ((pixels & (1 << i)) == 0)
+                continue;
+
+            int index = Index(selected, i);
+            lo = math.min(lo, index);
+            hi = math.max(hi, index);
+        }
+
+        // Pull the lowest indices up, then the highest down, then both.
+        for (int variant = 0; variant < 3; variant++)
+        {
+            ulong shifted = 0;
             for (int i = 0; i < 16; i++)
             {
                 if ((pixels & (1 << i)) == 0)
                     continue;
 
-                float w = Weight((int)(bestIndices >> (i * 4)) & 15, count) / 64f;
-                float u = 1f - w;
+                int index = Index(selected, i);
+                if (variant != 1 && index == lo && index < max)
+                    index++;
+                else if (variant != 0 && index == hi && index > 0)
+                    index--;
 
-                a += u * u;
-                b += u * w;
-                c += w * w;
-                d0 += u * target[i];
-                d1 += w * target[i];
+                shifted |= (ulong)index << (i * 4);
             }
 
-            float det = a * c - b * b;
-            if (math.abs(det) < 1e-6f)
-                break;
-
-            float inv = 1f / det;
-            QuantizePair(
-                (c * d0 - b * d1) * inv,
-                (a * d1 - b * d0) * inv,
-                mode,
-                out var newStart,
-                out var newEnd
-            );
-
-            float error = Assign(px, pixels, mode, newStart, newEnd, out ulong newIndices);
-            if (error >= best)
-                break;
-
-            best = error;
-            start = newStart;
-            end = newEnd;
-            bestIndices = newIndices;
+            TryLeastSquares(px, target, pixels, mode, shifted, ref fit);
         }
 
-        indices |= bestIndices;
-        return best;
+        // Remap the indices as though the endpoints sat a step or so outside or inside where
+        // they are now.
+        for (int low = -SpreadSteps; low <= 1; low++)
+        {
+            for (int high = max - 1; high <= max + SpreadSteps; high++)
+            {
+                if (low == 0 && high == max)
+                    continue;
+
+                ulong spread = 0;
+                for (int i = 0; i < 16; i++)
+                {
+                    if ((pixels & (1 << i)) == 0)
+                        continue;
+
+                    float remapped = math.floor(
+                        max * (float)(Index(selected, i) - low) / (high - low) + 0.5f
+                    );
+                    spread |= (ulong)math.clamp((int)remapped, 0, max) << (i * 4);
+                }
+
+                TryLeastSquares(px, target, pixels, mode, spread, ref fit);
+            }
+        }
+    }
+
+    // Solves for the endpoints that best reproduce the targets given these indices.
+    static bool TryLeastSquares(
+        float4* px,
+        float4* target,
+        int pixels,
+        Mode mode,
+        ulong selected,
+        ref SubsetFit fit
+    )
+    {
+        int count = 1 << mode.indexBits;
+
+        float a = 0f,
+            b = 0f,
+            c = 0f;
+        float4 d0 = 0f,
+            d1 = 0f;
+        for (int i = 0; i < 16; i++)
+        {
+            if ((pixels & (1 << i)) == 0)
+                continue;
+
+            float w = Weight(Index(selected, i), count) / 64f;
+            float u = 1f - w;
+
+            a += u * u;
+            b += u * w;
+            c += w * w;
+            d0 += u * target[i];
+            d1 += w * target[i];
+        }
+
+        float det = a * c - b * b;
+        if (math.abs(det) < 1e-6f)
+            return false;
+
+        float inv = 1f / det;
+        return Try(px, pixels, mode, (c * d0 - b * d1) * inv, (a * d1 - b * d0) * inv, ref fit);
+    }
+
+    // Quantizes the endpoints under every p-bit combination the mode allows.
+    static bool Try(float4* px, int pixels, Mode mode, float4 a, float4 b, ref SubsetFit fit)
+    {
+        bool improved = false;
+
+        int combinations = mode.sharedPBit ? 2 : 4;
+        for (int p = 0; p < combinations; p++)
+        {
+            int startPBit = mode.sharedPBit ? p : p & 1;
+            int endPBit = mode.sharedPBit ? p : p >> 1;
+
+            var start = Quantize(a, mode, startPBit);
+            var end = Quantize(b, mode, endPBit);
+            improved |= Evaluate(px, pixels, mode, start, end, ref fit);
+        }
+
+        return improved;
+    }
+
+    // Fits endpoints that put the mode's solid palette entry on the colour. Quantizing the
+    // endpoints to the colour itself only reaches the values an endpoint can hold, while an
+    // interpolated entry can land on nearly every value exactly.
+    static void TrySolid(float4* px, int pixels, Mode mode, float4 color, ref SubsetFit fit)
+    {
+        if (mode.solidIndex < 0)
+            return;
+
+        int w = Weight(mode.solidIndex, 1 << mode.indexBits);
+        int4 target = (int4)math.round(math.clamp(color, 0f, 255f));
+
+        int combinations = mode.sharedPBit ? 2 : 4;
+        for (int p = 0; p < combinations; p++)
+        {
+            var start = new Endpoint { pbit = mode.sharedPBit ? p : p & 1 };
+            var end = new Endpoint { pbit = mode.sharedPBit ? p : p >> 1 };
+
+            for (int ch = 0; ch < 4; ch++)
+            {
+                int bits = ch < 3 ? mode.colorBits : mode.alphaBits;
+                if (bits == 0)
+                {
+                    start.value[ch] = 255;
+                    end.value[ch] = 255;
+                    continue;
+                }
+
+                SolidChannel(target[ch], w, bits, ch, ref start, ref end);
+            }
+
+            Evaluate(px, pixels, mode, start, end, ref fit);
+        }
+    }
+
+    const int SolidSearchSteps = 4;
+
+    static void SolidChannel(int c, int w, int bits, int ch, ref Endpoint start, ref Endpoint end)
+    {
+        int max = (1 << bits) - 1;
+        int center = QuantizeChannel(c, bits, start.pbit);
+        int bestErr = int.MaxValue;
+
+        int first = math.max(center - SolidSearchSteps, 0);
+        int last = math.min(center + SolidSearchSteps, max);
+        for (int lo = first; lo <= last; lo++)
+        {
+            int loValue = Expand(lo << 1 | start.pbit, bits + 1);
+
+            // The end value that puts the interpolated entry closest to c.
+            float ideal = (64f * c - (64 - w) * loValue) / w;
+            int guess = QuantizeChannel(ideal, bits, end.pbit);
+
+            for (int hi = math.max(guess - 1, 0); hi <= math.min(guess + 1, max); hi++)
+            {
+                int hiValue = Expand(hi << 1 | end.pbit, bits + 1);
+                int value = ((64 - w) * loValue + w * hiValue + 32) >> 6;
+                int err = (value - c) * (value - c);
+                if (err >= bestErr)
+                    continue;
+
+                bestErr = err;
+                start.bits[ch] = lo;
+                start.value[ch] = loValue;
+                end.bits[ch] = hi;
+                end.value[ch] = hiValue;
+            }
+        }
+    }
+
+    static bool Evaluate(
+        float4* px,
+        int pixels,
+        Mode mode,
+        Endpoint start,
+        Endpoint end,
+        ref SubsetFit fit
+    )
+    {
+        float error = Assign(px, pixels, mode, start, end, out ulong indices);
+        if (error >= fit.error)
+            return false;
+
+        fit = new SubsetFit
+        {
+            start = start,
+            end = end,
+            indices = indices,
+            error = error,
+        };
+        return true;
     }
 
     // Picks the nearest palette entry for each pixel in the subset.
@@ -367,40 +583,13 @@ internal static unsafe class BC7
     // 4 bits: 0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64
     static int Weight(int index, int count) => (index * 64 + (count - 1) / 2) / (count - 1);
 
-    static void QuantizePair(float4 a, float4 b, Mode mode, out Endpoint start, out Endpoint end)
-    {
-        if (mode.sharedPBit)
-        {
-            var start0 = Quantize(a, mode, 0, out float startErr0);
-            var end0 = Quantize(b, mode, 0, out float endErr0);
-            var start1 = Quantize(a, mode, 1, out float startErr1);
-            var end1 = Quantize(b, mode, 1, out float endErr1);
-
-            bool one = startErr1 + endErr1 < startErr0 + endErr0;
-            start = one ? start1 : start0;
-            end = one ? end1 : end0;
-            return;
-        }
-
-        start = Quantize(a, mode);
-        end = Quantize(b, mode);
-    }
-
-    static Endpoint Quantize(float4 e, Mode mode)
-    {
-        var e0 = Quantize(e, mode, 0, out float err0);
-        var e1 = Quantize(e, mode, 1, out float err1);
-        return err1 < err0 ? e1 : e0;
-    }
-
     // Each channel is stored as its top bits plus the p-bit as the lowest, and the decoder
     // replicates the high bits of that into whatever is left of 8.
-    static Endpoint Quantize(float4 e, Mode mode, int pbit, out float error)
+    static Endpoint Quantize(float4 e, Mode mode, int pbit)
     {
         e = math.clamp(e, 0f, 255f);
 
         var endpoint = new Endpoint { pbit = pbit };
-        error = 0f;
 
         for (int ch = 0; ch < 4; ch++)
         {
@@ -412,31 +601,31 @@ internal static unsafe class BC7
             }
 
             int max = (1 << bits) - 1;
-            int guess = (int)math.round((e[ch] * ((2 << bits) - 1) / 255f - pbit) * 0.5f);
+            int guess = QuantizeChannel(e[ch], bits, pbit);
 
-            int bestBits = 0;
-            int bestValue = 0;
             float bestErr = float.PositiveInfinity;
-
             for (int c = math.max(guess - 1, 0); c <= math.min(guess + 1, max); c++)
             {
                 int value = Expand(c << 1 | pbit, bits + 1);
                 float d = value - e[ch];
-                if (d * d < bestErr)
-                {
-                    bestErr = d * d;
-                    bestBits = c;
-                    bestValue = value;
-                }
-            }
+                if (d * d >= bestErr)
+                    continue;
 
-            endpoint.bits[ch] = bestBits;
-            endpoint.value[ch] = bestValue;
-            error += bestErr;
+                bestErr = d * d;
+                endpoint.bits[ch] = c;
+                endpoint.value[ch] = value;
+            }
         }
 
         return endpoint;
     }
+
+    static int QuantizeChannel(float v, int bits, int pbit) =>
+        math.clamp(
+            (int)math.round((v * ((2 << bits) - 1) / 255f - pbit) * 0.5f),
+            0,
+            (1 << bits) - 1
+        );
 
     static int Expand(int value, int bits) => value << (8 - bits) | value >> (2 * bits - 8);
 
