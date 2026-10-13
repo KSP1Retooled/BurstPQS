@@ -1376,7 +1376,7 @@ internal static partial class TextureExporter
                     block.oceanJobSetGuard.Dependency
                 );
 
-                if (oceanBatchPQS is null)
+                if (oceanBatchPQS is not null)
                 {
                     handle = oceanJob.Schedule(handle);
                 }
