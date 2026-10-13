@@ -1520,7 +1520,7 @@ public class BatchPQS : MonoBehaviour
                 pq = new(quad),
             };
 
-            handle = job.Schedule();
+            handle = job.Schedule(jobSet.Dependency);
 
             return true;
         }

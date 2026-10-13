@@ -268,6 +268,7 @@ internal static partial class TextureExporter
         ObjectHandle<BatchPQSJobSet> handle;
 
         public readonly ObjectHandle<BatchPQSJobSet> Handle => handle;
+        public readonly JobHandle Dependency => jobSet.Dependency;
 
         public JobSetGuard(BatchPQS batchPQS, PQ quad)
         {
@@ -1291,14 +1292,14 @@ internal static partial class TextureExporter
             JobHandle handle;
             if (batchPQS is not null)
             {
-                handle = blockJob.Schedule();
+                handle = blockJob.Schedule(block.jobSetGuard.Dependency);
             }
             else
             {
                 using (new FallbackBuildingMapsGuard(pqs))
                     blockJob.ExecuteFallback(pqs, quad);
 
-                handle = default;
+                handle = block.jobSetGuard.Dependency;
             }
 
             // Copy terrain data to terrain output arrays.
@@ -1369,6 +1370,11 @@ internal static partial class TextureExporter
                     blockHeights = oceanBlockHeights,
                     blockNormals = oceanBlockNormals,
                 };
+
+                handle = JobHandle.CombineDependencies(
+                    handle,
+                    block.oceanJobSetGuard.Dependency
+                );
 
                 if (oceanBatchPQS is null)
                 {

@@ -355,6 +355,28 @@ public class TangentTextureRanges(PQSMod_TangentTextureRanges mod)
 }
 ```
 
+## Depending on Other Jobs
+If your mod schedules its own Unity jobs in `OnQuadPreBuild` (e.g. to precompute
+data that your build job reads) then you can make the quad build job wait for
+them by calling `jobSet.AddDependency(handle)`:
+
+```cs
+public override void OnQuadPreBuild(PQ quad, BatchPQSJobSet jobSet)
+{
+    base.OnQuadPreBuild(quad, jobSet);
+
+    var data = new NativeArray<double>(count, Allocator.TempJob);
+    var handle = new PrecomputeJob { data = data }.Schedule();
+
+    jobSet.AddDependency(handle);
+    jobSet.Add(new BuildJob { data = data });
+}
+```
+
+The build job will not start until every dependency has completed. Any
+`IDisposable` cleanup on your job struct still runs after the build job, so it
+is safe to dispose resources shared with the jobs you depend on there.
+
 ## Modifying Mesh Data
 Some stock PQSMods modify the final mesh in `OnMeshBuild` callbacks. By default,
 these will work correctly with BurstPQS but they tend to be much slower then they

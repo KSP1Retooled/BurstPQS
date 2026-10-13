@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Unity.Jobs;
 
 namespace BurstPQS;
 
@@ -25,6 +26,9 @@ public class BatchPQSJobSet : IDisposable
     }
 
     readonly List<JobData> jobs = [];
+    JobHandle dependency;
+
+    internal JobHandle Dependency => dependency;
 
     internal BatchPQSJobSet() { }
 
@@ -54,6 +58,22 @@ public class BatchPQSJobSet : IDisposable
         where T : struct
     {
         jobs.Add(JobData<T>.Create(job));
+    }
+
+    /// <summary>
+    /// Make the build job wait for <paramref name="handle"/> to complete
+    /// before it starts.
+    /// </summary>
+    /// <param name="handle"></param>
+    ///
+    /// <remarks>
+    /// Use this when you schedule your own jobs in
+    /// <c><see cref="BatchPQSMod.OnQuadPreBuild(PQ, BatchPQSJobSet)"/></c>
+    /// that produce data used by a job you have added to this set.
+    /// </remarks>
+    public void AddDependency(JobHandle handle)
+    {
+        dependency = JobHandle.CombineDependencies(dependency, handle);
     }
 
     internal void BuildHeights(in BuildHeightsData data)
@@ -109,6 +129,7 @@ public class BatchPQSJobSet : IDisposable
         finally
         {
             jobs.Clear();
+            dependency = default;
             Pool.Push(this);
         }
     }
