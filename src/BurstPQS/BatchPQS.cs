@@ -875,22 +875,26 @@ public class BatchPQS : MonoBehaviour
         // vessels lose the ground under them while moving. The camera doesn't
         // need colliders so it keeps the normal cap.
         int colliderLevel = GetColliderLevel();
+        var planetToWorld = double4x4.identity;
 
         if (HighLogic.LoadedSceneIsFlight && body != null)
         {
-            // The camera follows the active vessel, so use the terrain and
-            // speed under it.
+            planetToWorld = GetPreciseLocalToWorld();
+
             var camera = FlightCamera.fetch;
-            var activeVessel = FlightGlobals.ActiveVessel;
             if (camera != null && camera.mainCamera != null)
             {
+                var cameraPosition = BurstUtil.ConvertVector(
+                    (Vector3d)camera.mainCamera.transform.position
+                );
+
                 inputs.Add(
                     new SubdivisionTargetInput
                     {
-                        worldPosition = BurstUtil.ConvertVector(
-                            (Vector3d)camera.mainCamera.transform.position
+                        worldPosition = cameraPosition,
+                        surfaceSpeed = UpdateCameraSpeed(
+                            math.mul(math.inverse(planetToWorld), new double4(cameraPosition, 1.0)).xyz
                         ),
-                        surfaceSpeed = activeVessel != null ? activeVessel.srfSpeed : 0.0,
                     }
                 );
             }
@@ -936,7 +940,7 @@ public class BatchPQS : MonoBehaviour
                 colliderLevel = primaryColliderLevel,
                 vesselRadius = primaryRadius,
             },
-            planetToWorld = inputs.Length != 0 ? GetPreciseLocalToWorld() : double4x4.identity,
+            planetToWorld = planetToWorld,
             radius = pqs.radius,
             maxDetailDistance = pqs.maxDetailDistance,
             collapseSeaLevelValue = pqs.collapseSeaLevelValue,
@@ -954,6 +958,44 @@ public class BatchPQS : MonoBehaviour
     // vesselSize is the craft's bounding box, but the vessel position isn't
     // at its centre, so use the whole diagonal.
     static double GetVesselRadius(Vessel vessel) => vessel.vesselSize.magnitude;
+
+    const double CameraSpeedHalfLife = 0.1;
+
+    double3 lastCameraPosition;
+    int lastCameraFrame = -1;
+    Vessel lastCameraVessel;
+    double smoothedCameraSpeed;
+
+    double UpdateCameraSpeed(double3 position)
+    {
+        var vessel = FlightGlobals.ActiveVessel;
+        var lastPosition = lastCameraPosition;
+        bool continuous = lastCameraFrame == Time.frameCount - 1 && lastCameraVessel == vessel;
+
+        lastCameraPosition = position;
+        lastCameraFrame = Time.frameCount;
+        lastCameraVessel = vessel;
+
+        // Vessel switches and skipped frames teleport the camera.
+        if (!continuous)
+        {
+            smoothedCameraSpeed = 0.0;
+            return 0.0;
+        }
+
+        double dt = Time.deltaTime;
+        if (dt <= 0.0)
+            return smoothedCameraSpeed;
+
+        // Decay speed exponentially with a half-life of 0.1s so that it takes
+        // a little bit until we subdivide again. This helps prevent lag when
+        // swinging the camera around.
+        var speed = math.distance(position, lastPosition) / dt;
+        var decay = math.exp2(-Time.unscaledDeltaTime / CameraSpeedHalfLife);
+        smoothedCameraSpeed = math.lerp(speed, smoothedCameraSpeed, decay);
+        smoothedCameraSpeed = math.max(smoothedCameraSpeed, speed);
+        return smoothedCameraSpeed;
+    }
 
     int GetColliderLevel()
     {
