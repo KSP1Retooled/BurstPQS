@@ -222,6 +222,10 @@ internal static class PQS_AssignQuad_Patch
 {
     static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
     {
+        var getQuad = SymbolExtensions.GetMethodInfo<PQSCache>(cache => cache.GetQuad());
+        var getQuadReplacement = SymbolExtensions.GetMethodInfo(() =>
+            BatchPQS.GetCachedQuad(null, null, 0)
+        );
         var setParent = AccessTools.PropertySetter(typeof(Transform), nameof(Transform.parent));
         var replacement = SymbolExtensions.GetMethodInfo(() =>
             BatchPQS.AssignQuadParent(null, null, null, 0)
@@ -229,6 +233,13 @@ internal static class PQS_AssignQuad_Patch
 
         var matcher = new CodeMatcher(instructions);
         matcher
+            .MatchStartForward(new CodeMatch(OpCodes.Callvirt, getQuad))
+            .ThrowIfInvalid("Could not find call to PQSCache.GetQuad in PQS.AssignQuad")
+            .SetInstructionAndAdvance(new CodeInstruction(OpCodes.Ldarg_0))
+            .Insert(
+                new CodeInstruction(OpCodes.Ldarg_1),
+                new CodeInstruction(OpCodes.Call, getQuadReplacement)
+            )
             .MatchStartForward(new CodeMatch(OpCodes.Callvirt, setParent))
             .ThrowIfInvalid("Could not find call to Transform.set_parent in PQS.AssignQuad")
             .SetInstructionAndAdvance(new CodeInstruction(OpCodes.Ldarg_0))
@@ -239,6 +250,32 @@ internal static class PQS_AssignQuad_Patch
 
         return matcher.Instructions();
     }
+}
+
+[HarmonyPatch(typeof(PQSCache), nameof(PQSCache.DestroyQuad))]
+internal static class PQSCache_DestroyQuad_Patch
+{
+    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+    {
+        var setParent = AccessTools.PropertySetter(typeof(Transform), nameof(Transform.parent));
+        var replacement = SymbolExtensions.GetMethodInfo(() =>
+            BatchPQS.ReleaseQuadParent(null, null)
+        );
+
+        var matcher = new CodeMatcher(instructions);
+        matcher
+            .MatchStartForward(new CodeMatch(OpCodes.Callvirt, setParent))
+            .ThrowIfInvalid("Could not find call to Transform.set_parent in PQSCache.DestroyQuad")
+            .SetInstruction(new CodeInstruction(OpCodes.Call, replacement));
+
+        return matcher.Instructions();
+    }
+}
+
+[HarmonyPatch(typeof(PQS), nameof(PQS.Start))]
+internal static class PQS_Start_Patch
+{
+    static void Postfix(PQS __instance) => BatchPQS.RegisterLocalSpaceStorage(__instance);
 }
 
 [HarmonyPatch(typeof(PQS), nameof(PQS.UpdateEdgeNormals))]

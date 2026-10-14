@@ -314,6 +314,14 @@ public class BatchPQS : MonoBehaviour
             transform.SetParent(parent, false);
     }
 
+    static BatchPQS GetPlacementManager(PQS pqs, int subdiv)
+    {
+        var batchPQS = subdiv > 0 ? Get(pqs) : null;
+        if (batchPQS is not null && batchPQS.ManagesQuadPlacement)
+            return batchPQS;
+        return null;
+    }
+
     // Replaces the parent assignment in PQS.AssignQuad. Child quads go
     // straight to the parent PlaceQuad will use, so they only change
     // hierarchy once.
@@ -324,14 +332,65 @@ public class BatchPQS : MonoBehaviour
         int subdiv
     )
     {
-        var batchPQS = subdiv > 0 ? Get(pqs) : null;
-        if (batchPQS is not null && batchPQS.ManagesQuadPlacement)
+        var batchPQS = GetPlacementManager(pqs, subdiv);
+        if (batchPQS is not null)
         {
             SetParentIfChanged(transform, batchPQS.QuadParent);
             return;
         }
 
-        transform.parent = parent;
+        if (transform.parent != parent)
+            transform.parent = parent;
+    }
+
+    // Replaces PQSCache.GetQuad in PQS.AssignQuad. When the cache is empty
+    // stock creates a batch of quads under the cache, each of which then has
+    // to be moved into the sphere. We create a single quad directly under the
+    // parent AssignQuadParent will pick instead.
+    internal static PQ GetCachedQuad(PQSCache cache, PQS pqs, int subdiv)
+    {
+        if (cache.cachePQUnassignedCount > 0)
+            return cache.GetQuad();
+
+        var batchPQS = GetPlacementManager(pqs, subdiv);
+        var parent = batchPQS is not null ? batchPQS.QuadParent : pqs.transform;
+        var quad = CreateCacheQuad(cache, parent);
+
+        cache.cachePQTotalCount++;
+        cache.cachePQAssignedCount++;
+        return quad;
+    }
+
+    static PQ quadTemplate;
+
+    // Mirrors PQSCache.IncreasePQCache. The template is inactive so the
+    // clone stays inactive until AssignQuad activates it.
+    static PQ CreateCacheQuad(PQSCache cache, Transform parent)
+    {
+        if (quadTemplate == null)
+        {
+            var templateGo = new GameObject("PQ");
+            templateGo.SetActive(false);
+            templateGo.transform.SetParent(cache.transform, false);
+
+            quadTemplate = templateGo.AddComponent<PQ>();
+            quadTemplate.meshFilter = templateGo.AddComponent<MeshFilter>();
+            quadTemplate.meshRenderer = templateGo.AddComponent<MeshRenderer>();
+            quadTemplate.meshRenderer.shadowCastingMode = ShadowCastingMode.Off;
+            quadTemplate.meshRenderer.receiveShadows = false;
+        }
+
+        // The mesh is left empty since building the quad replaces all of it.
+        var quad = Instantiate(quadTemplate, parent, false);
+        quad.mesh = new Mesh();
+        quad.meshFilter.sharedMesh = quad.mesh;
+        quad.verts = new Vector3[PQS.cacheVertCount];
+        quad.vertNormals = new Vector3[PQS.cacheVertCount];
+        quad.edgeNormals = new Vector3[4][];
+        for (int i = 0; i < 4; i++)
+            quad.edgeNormals[i] = new Vector3[PQS.cacheSideVertCount];
+
+        return quad;
     }
 
     // Replaces the parent assignments in PQ.SetupQuad. PlaceQuad runs after
@@ -342,7 +401,40 @@ public class BatchPQS : MonoBehaviour
         if (batchPQS is not null && batchPQS.ManagesQuadPlacement)
             return;
 
-        transform.parent = parent;
+        if (transform.parent != parent)
+            transform.parent = parent;
+    }
+
+    // The shared PQStorage under LocalSpace. Unlike the sphere transforms it
+    // never moves, so released quads can stay there until they are reused.
+    static Transform localSpaceStorage;
+
+    internal static void RegisterLocalSpaceStorage(PQS pqs)
+    {
+        var storage = pqs.LocalSpacePQStorage;
+        if (storage == null || LocalSpace.fetch == null || pqs.cache == null)
+            return;
+        if (storage.transform.parent != LocalSpace.fetch.transform)
+            return;
+
+        // Released quads are still owned by the cache, so they must not be
+        // destroyed along with a scene the cache outlives.
+        if (storage.scene != pqs.cache.gameObject.scene)
+            return;
+
+        localSpaceStorage = storage.transform;
+    }
+
+    // Replaces the parent assignment in PQSCache.DestroyQuad.
+    internal static void ReleaseQuadParent(Transform transform, Transform cacheTransform)
+    {
+        var parent = transform.parent;
+        if (parent == cacheTransform)
+            return;
+        if (localSpaceStorage != null && parent == localSpaceStorage)
+            return;
+
+        transform.SetParent(cacheTransform, false);
     }
 
     void RemoveFromStorage(PQ quad)
@@ -577,8 +669,14 @@ public class BatchPQS : MonoBehaviour
     // Replaces mesh.triangles in PQ.UpdateVisibility.
     internal static void SetQuadTriangles(Mesh mesh, int[] indices)
     {
-        QuadColliderBaker.CompleteBake();
         int vertexCount = mesh.vertexCount;
+        // A new quad's mesh stays empty until its deferred build sets the
+        // indices for its edge state.
+        if (vertexCount == 0)
+            return;
+
+        QuadColliderBaker.CompleteBake();
+
         if (vertexCount != PQS.cacheVertCount)
         {
             mesh.triangles = indices;
