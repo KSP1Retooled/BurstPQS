@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## v1.0.27
+### Changed
+* We now take the camera velocity into account when deciding whether to subdivide
+  terrain near the camera. This should fix some lag when swinging the camera around.
+* A few more minor optimizations to overhead when subdividing terrain.
+
 ## v1.0.26
 ### Added
 * The texture exporter now lets you pick between multiple different formats for
