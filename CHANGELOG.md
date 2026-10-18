@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## v1.0.28
+### Fixed
+* Fixed an issue where BurstPQS was causing all parallax scatters to be tilted.
+
 ## v1.0.27
 ### Changed
 * We now take the camera velocity into account when deciding whether to subdivide
