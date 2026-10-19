@@ -1,3 +1,4 @@
+extern alias UnityJobs;
 using BurstPQS.Util.Textures;
 using Unity.Burst;
 using Unity.Collections;
