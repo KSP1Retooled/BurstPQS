@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## v1.0.29
 ### Fixed
-* Fixed an issue where an exception getting thrown during texture exporet
+* Fixed an issue where an exception getting thrown during texture export
   would permanently break the texture exporter.
 * Fixed an issue where any planet in fallback mode with a parallax pqsmod
   would throw an exception during texture export.
