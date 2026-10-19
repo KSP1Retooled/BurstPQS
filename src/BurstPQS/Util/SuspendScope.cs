@@ -9,12 +9,10 @@ internal struct SuspendProfileScope : IDisposable
 
     public SuspendProfileScope(ProfilerMarker.AutoScope scope)
     {
-        ProfilerMarker.Internal_End(scope.m_Ptr);
         this.scope = scope;
     }
 
     public void Dispose()
     {
-        ProfilerMarker.Internal_Begin(scope.m_Ptr);
     }
 }

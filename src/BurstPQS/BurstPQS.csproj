@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <Description>Burst-Accelerated PQS</Description>
 
@@ -15,36 +15,38 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
 
-    <Reference Include="HarmonyKSP">
-      <HintPath>$(DepSet1)/000_Harmony/0Harmony.dll</HintPath>
-      <Private>false</Private>
-      <KSPAssemblyName>HarmonyKSP</KSPAssemblyName>
-      <KSPAssemblyVersion>0.0.0</KSPAssemblyVersion>
-      <GenerateDependencyAttribute>true</GenerateDependencyAttribute>
-    </Reference>
-
-    <Reference Include="KSPBurst">
-      <HintPath>$(DepSet1)/000_KSPBurst/Plugins/Unity.Burst.dll</HintPath>
-      <Private>false</Private>
-      <KSPAssemblyName>KSPBurst</KSPAssemblyName>
-      <KSPAssemblyVersion>1.5.5</KSPAssemblyVersion>
-      <GenerateDependencyAttribute>true</GenerateDependencyAttribute>
-    </Reference>
-
     <Reference Include="$(DepSet1)/000_KSPBurst/Plugins/Unity.*.dll">
       <Private>false</Private>
     </Reference>
-    <Reference Include="$(DepSet1)/000_KSPBurst/Plugins/System.Runtime.CompilerServices.Unsafe.dll">
+	
+    <Reference Include="$(KSPBT_GameRoot)/KSP_x64_Data/Managed/System.Runtime.CompilerServices.Unsafe.dll">
       <Private>false</Private>
+    </Reference>
+
+    <Reference Include="0Harmony">
+      <HintPath>$(DepSet1)/000_Harmony/0Harmony.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+
+    <Reference Include="KSPBurst">
+      <HintPath>$(DepSet1)/000_KSPBurst/Plugins/KSPBurst.dll</HintPath>
+      <Private>False</Private>
     </Reference>
 
     <Reference Include="KSPTextureLoader">
       <HintPath>$(DepSet1)/KSPTextureLoader/Plugins/KSPTextureLoader.dll</HintPath>
-      <Private>false</Private>
-      <KSPAssemblyName>KSPTextureLoader</KSPAssemblyName>
-      <KSPAssemblyVersion>1.0.27</KSPAssemblyVersion>
-      <GenerateDependencyAttribute>true</GenerateDependencyAttribute>
+      <Private>False</Private>
     </Reference>
+
+    <Reference Include="netstandard">
+	  <HintPath>$(KSPBT_GameRoot)/KSP_x64_Data/Managed/netstandard.dll</HintPath>
+      <Private>False</Private>
+	</Reference>
+	
+	<Reference Include="mscorlib">
+	  <HintPath>$(KSPBT_GameRoot)/KSP_x64_Data/Managed/mscorlib.dll</HintPath>
+      <Private>False</Private>
+	</Reference>
 
     <KSPVersionFile Include=".">
       <Destination>$(GameDataOutDir)/BurstPQS.version</Destination>
@@ -62,9 +64,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\BurstPQS.Generators\BurstPQS.Generators.csproj"
-                      OutputItemType="Analyzer"
-                      ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\BurstPQS.Generators\BurstPQS.Generators.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <ItemGroup>
@@ -73,8 +73,8 @@
     <Publicize Include="UnityEngine.CoreModule:Unity.Profiling.ProfilerMarker.Internal_Begin" />
     <Publicize Include="UnityEngine.CoreModule:Unity.Profiling.ProfilerMarker.Internal_End" />
     <Publicize Include="UnityEngine.CoreModule:Unity.Profiling.ProfilerMarker+AutoScope.m_Ptr" />
-    <Publicize Include="UnityEngine.CoreModule:UnityEngine.NoAllocHelpers" />
-    <Publicize Include="UnityEngine.CoreModule:UnityEngine.NoAllocHelpers.ExtractArrayFromListT" />
+    <Publicize Include="UnityEngine.ScriptingModule:UnityEngine.NoAllocHelpers" />
+    <Publicize Include="UnityEngine.ScriptingModule:UnityEngine.NoAllocHelpers.ExtractArrayFromListT" />
   </ItemGroup>
 
   <!--

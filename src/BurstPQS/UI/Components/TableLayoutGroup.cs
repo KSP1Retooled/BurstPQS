@@ -97,7 +97,7 @@ internal class TableLayoutGroup : LayoutGroup
         float spacingWidth = _columnCount > 1 ? (_columnCount - 1) * columnSpacing : 0f;
         float totalMinWidth = padding.horizontal + spacingWidth + _columnCount * minimumColumnWidth;
 
-        SetLayoutInputForAxis(totalMinWidth, totalMinWidth, 1, 0);
+        SetLayoutInputForAxis(totalMinWidth, totalMinWidth, totalMinWidth, 1, 0);
     }
 
     public override void CalculateLayoutInputVertical()
@@ -119,7 +119,7 @@ internal class TableLayoutGroup : LayoutGroup
         if (actualRowCount > 0)
             verticalSize -= rowSpacing;
 
-        SetLayoutInputForAxis(verticalSize, verticalSize, 0, 1);
+        SetLayoutInputForAxis(verticalSize, verticalSize, verticalSize, 0, 1);
     }
 
     public override void SetLayoutHorizontal()
